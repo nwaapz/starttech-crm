@@ -612,11 +612,17 @@ function sw_is_legacy_group_id(int $id): bool
  * Category buckets for inventory that has no remote group card
  * (the previous ~400k S/M serials that lived only in old_serials).
  */
-function sw_append_legacy_inventory_cards(mysqli $conn, string $table, array &$items): void
-{
+function sw_append_legacy_inventory_cards(
+    mysqli $conn,
+    string $table,
+    array &$items,
+    ?array $precomputedRows = null
+): void {
     $hasCategory = column_exists($conn, $table, 'category');
     $hasLan = column_exists($conn, $table, 'lan_group_id');
-    if (!$hasLan) {
+    if ($precomputedRows !== null) {
+        $res = new ArrayIterator($precomputedRows);
+    } elseif (!$hasLan) {
         // No lan_group_id column → treat entire table as legacy by category/all.
         if ($hasCategory) {
             $res = $conn->query(
@@ -658,8 +664,15 @@ function sw_append_legacy_inventory_cards(mysqli $conn, string $table, array &$i
     if (!$res) {
         return;
     }
+    if ($res instanceof mysqli_result) {
+        $rows = [];
+        while ($r = $res->fetch_assoc()) {
+            $rows[] = $r;
+        }
+        $res = $rows;
+    }
 
-    while ($row = $res->fetch_assoc()) {
+    foreach ($res as $row) {
         $total = (int) ($row['total'] ?? 0);
         if ($total <= 0) {
             continue;
@@ -695,6 +708,72 @@ function sw_append_legacy_inventory_cards(mysqli $conn, string $table, array &$i
     }
 }
 
+/**
+ * Per-group and legacy (ungrouped) serial counts from ONE table scan, cached 2 min.
+ * Cache key includes the serial_groups signature so creating/deleting a card refreshes it.
+ *
+ * @return array{groups:array<int,array{total:int,used:int}>,legacy:?list<array{category:string,total:int,used:int}>,cached?:bool}
+ */
+function sw_group_count_snapshot(mysqli $conn, string $table): array
+{
+    if (!column_exists($conn, $table, 'lan_group_id')) {
+        return ['groups' => [], 'legacy' => null];
+    }
+    $sig = '';
+    $r = $conn->query('SELECT COUNT(*) AS c, COALESCE(MAX(id), 0) AS m FROM serial_groups');
+    if ($r && ($row = $r->fetch_assoc())) {
+        $sig = $row['c'] . ':' . $row['m'];
+    }
+    $cacheKey = 'serial_group_counts_' . $table . '_' . md5($sig);
+    $cached = crm_cache_get($cacheKey, 120);
+    if (is_array($cached) && isset($cached['groups'])) {
+        $groups = [];
+        foreach ($cached['groups'] as $gid => $c) {
+            $groups[(int) $gid] = $c;
+        }
+        return ['groups' => $groups, 'legacy' => $cached['legacy'] ?? [], 'cached' => true];
+    }
+
+    $reg = is_registered_sql('t');
+    $catExpr = column_exists($conn, $table, 'category') ? 't.category' : "'end_user_client'";
+    $res = $conn->query(
+        "SELECT t.lan_group_id AS gid,
+                (g.id IS NULL) AS ungrouped,
+                $catExpr AS category,
+                COUNT(*) AS total,
+                SUM(CASE WHEN $reg THEN 1 ELSE 0 END) AS used
+         FROM `$table` t
+         LEFT JOIN serial_groups g ON g.id = t.lan_group_id
+         GROUP BY t.lan_group_id, (g.id IS NULL), $catExpr"
+    );
+    $groups = [];
+    $legacyByCat = [];
+    if ($res) {
+        while ($row = $res->fetch_assoc()) {
+            $total = (int) $row['total'];
+            $used = (int) $row['used'];
+            if ((int) $row['ungrouped'] === 1) {
+                $cat = (string) ($row['category'] ?? '');
+                if (!isset($legacyByCat[$cat])) {
+                    $legacyByCat[$cat] = ['category' => $cat, 'total' => 0, 'used' => 0];
+                }
+                $legacyByCat[$cat]['total'] += $total;
+                $legacyByCat[$cat]['used'] += $used;
+            } else {
+                $gid = (int) $row['gid'];
+                if (!isset($groups[$gid])) {
+                    $groups[$gid] = ['total' => 0, 'used' => 0];
+                }
+                $groups[$gid]['total'] += $total;
+                $groups[$gid]['used'] += $used;
+            }
+        }
+    }
+    $legacy = array_values($legacyByCat);
+    crm_cache_set($cacheKey, ['groups' => $groups, 'legacy' => $legacy]);
+    return ['groups' => $groups, 'legacy' => $legacy];
+}
+
 function sw_list_groups(mysqli $conn): void
 {
     $table = serials_table($conn);
@@ -705,23 +784,13 @@ function sw_list_groups(mysqli $conn): void
         json_error('Failed to list serial groups: ' . $conn->error, 500);
     }
 
-    $countsByGroup = [];
-    $registeredSql = is_registered_sql();
-    $countRes = $conn->query(
-        "SELECT lan_group_id AS gid,
-                COUNT(*) AS total,
-                SUM(CASE WHEN $registeredSql THEN 1 ELSE 0 END) AS used
-         FROM `$table`
-         WHERE lan_group_id IS NOT NULL
-         GROUP BY lan_group_id"
-    );
-    if ($countRes) {
-        while ($cRow = $countRes->fetch_assoc()) {
-            $countsByGroup[(int) ($cRow['gid'] ?? 0)] = $cRow;
-        }
-    }
+    $snapshot = sw_group_count_snapshot($conn, $table);
+    $countsByGroup = $snapshot['groups'] ?? [];
     if (function_exists('crm_debug_mark')) {
-        crm_debug_mark('serial_groups_counts', count($countsByGroup) . ' groups');
+        crm_debug_mark(
+            'serial_groups_counts',
+            count($countsByGroup) . ' groups' . (!empty($snapshot['cached']) ? ' (cached)' : ' (scanned)')
+        );
     }
 
     $items = [];
@@ -734,7 +803,7 @@ function sw_list_groups(mysqli $conn): void
     }
 
     // Keep the old category inventory cards for S/M stock that has no remote group.
-    sw_append_legacy_inventory_cards($conn, $table, $items);
+    sw_append_legacy_inventory_cards($conn, $table, $items, $snapshot['legacy'] ?? null);
     if (function_exists('crm_debug_mark')) {
         crm_debug_mark('serial_groups_list', count($items) . ' cards');
     }
