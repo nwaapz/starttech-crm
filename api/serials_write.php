@@ -709,6 +709,9 @@ function sw_list_groups(mysqli $conn): void
             $countsByGroup[(int) ($cRow['gid'] ?? 0)] = $cRow;
         }
     }
+    if (function_exists('crm_debug_mark')) {
+        crm_debug_mark('serial_groups_counts', count($countsByGroup) . ' groups');
+    }
 
     $items = [];
     while ($row = $res->fetch_assoc()) {
@@ -721,6 +724,9 @@ function sw_list_groups(mysqli $conn): void
 
     // Keep the old category inventory cards for S/M stock that has no remote group.
     sw_append_legacy_inventory_cards($conn, $table, $items);
+    if (function_exists('crm_debug_mark')) {
+        crm_debug_mark('serial_groups_list', count($items) . ' cards');
+    }
 
     json_out(['items' => $items]);
 }

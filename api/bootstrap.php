@@ -56,16 +56,101 @@ if (!is_file($dbConfig)) {
 require_once $dbConfig;
 
 header('Access-Control-Allow-Origin: *');
-header('Access-Control-Allow-Headers: Authorization, Content-Type, X-Sync-Token');
+header('Access-Control-Allow-Headers: Authorization, Content-Type, X-Sync-Token, X-Crm-Debug');
 header('Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS');
 if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'OPTIONS') {
     http_response_code(204);
     exit;
 }
 
+/** @var array{start:float,steps:list<array{label:string,ms:float,detail?:string}>}|null */
+$GLOBALS['crm_debug'] = null;
+
+function crm_debug_enabled(): bool
+{
+    if (isset($_GET['debug']) && (string) $_GET['debug'] === '1') {
+        return true;
+    }
+    $hdr = $_SERVER['HTTP_X_CRM_DEBUG'] ?? '';
+    return $hdr === '1' || strtolower((string) $hdr) === 'true';
+}
+
+function crm_debug_init(string $path, string $method): void
+{
+    if (!crm_debug_enabled()) {
+        return;
+    }
+    $GLOBALS['crm_debug'] = ['start' => microtime(true), 'path' => $path, 'method' => $method, 'steps' => []];
+    crm_debug_mark('request_start');
+}
+
+function crm_debug_mark(string $label, ?string $detail = null): void
+{
+    if ($GLOBALS['crm_debug'] === null) {
+        return;
+    }
+    $now = microtime(true);
+    $prev = $GLOBALS['crm_debug']['start'];
+    if ($GLOBALS['crm_debug']['steps'] !== []) {
+        $last = $GLOBALS['crm_debug']['steps'][count($GLOBALS['crm_debug']['steps']) - 1];
+        $prev = $last['at'];
+    }
+    $GLOBALS['crm_debug']['steps'][] = [
+        'label' => $label,
+        'ms' => round(($now - $prev) * 1000, 2),
+        'at' => $now,
+        'detail' => $detail,
+    ];
+}
+
+/** @return array<string,mixed>|null */
+function crm_debug_payload(): ?array
+{
+    if ($GLOBALS['crm_debug'] === null) {
+        return null;
+    }
+    $start = $GLOBALS['crm_debug']['start'];
+    $totalMs = round((microtime(true) - $start) * 1000, 2);
+    $cumulative = 0.0;
+    $steps = [];
+    foreach ($GLOBALS['crm_debug']['steps'] as $step) {
+        $cumulative += (float) $step['ms'];
+        $row = [
+            'label' => $step['label'],
+            'ms' => $step['ms'],
+            'cumulativeMs' => round($cumulative, 2),
+        ];
+        if (!empty($step['detail'])) {
+            $row['detail'] = $step['detail'];
+        }
+        $steps[] = $row;
+    }
+    return [
+        'path' => $GLOBALS['crm_debug']['path'] ?? '',
+        'method' => $GLOBALS['crm_debug']['method'] ?? '',
+        'totalMs' => $totalMs,
+        'steps' => $steps,
+        'php' => PHP_VERSION,
+        'memoryMb' => round(memory_get_peak_usage(true) / 1048576, 1),
+    ];
+}
+
+function crm_debug_attach(array $data): array
+{
+    $dbg = crm_debug_payload();
+    if ($dbg !== null) {
+        $data['_debug'] = $dbg;
+        header('X-Crm-Debug-Total-Ms: ' . $dbg['totalMs']);
+    }
+    return $data;
+}
+
 function json_out($data, int $code = 200): void {
     http_response_code($code);
     header('Content-Type: application/json; charset=utf-8');
+    if (is_array($data)) {
+        $data = crm_debug_attach($data);
+    }
     echo json_encode($data, JSON_UNESCAPED_UNICODE);
     exit;
 }

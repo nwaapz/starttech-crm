@@ -10,6 +10,7 @@ require_once __DIR__ . '/bootstrap.php';
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
 $uri = $_SERVER['REQUEST_URI'] ?? '/';
 $path = parse_url($uri, PHP_URL_PATH) ?: '/';
+crm_debug_init($path, $method);
 
 // Strip /crm/api or /api prefix
 $path = preg_replace('#^.*?/api(?:/index\.php)?#', '', $path) ?? '';
@@ -73,8 +74,11 @@ if (
     exit;
 }
 
+crm_debug_mark('bootstrap_loaded');
 $conn = payamesh_mysqli();
+crm_debug_mark('db_connect');
 ensure_remote_schema($conn);
+crm_debug_mark('ensure_remote_schema');
 
 // --- Public (kept for older clients that expected health after schema) ---
 if ($path === '/ping' && $method === 'GET') {
@@ -133,6 +137,7 @@ if ($path === '/auth/login' && $method === 'POST') {
 
 // Everything below requires auth
 $user = require_auth($conn);
+crm_debug_mark('auth_ok', $user['username'] ?? '');
 
 if ($path === '/auth/me' && $method === 'GET') {
     json_out(['id' => $user['id'], 'username' => $user['username'], 'role' => $user['role']]);
@@ -142,13 +147,15 @@ if ($path === '/sync' && $method === 'GET') {
     $table = serials_table($conn);
     $since = (int) ($_GET['since'] ?? 0);
     $stats = serial_cached_stats($conn, $table, $since === 0);
+    crm_debug_mark('sync_cached_stats', 'since=' . $since);
     $now = (int) (microtime(true) * 1000);
     require_once __DIR__ . '/activity_store.php';
-    $changes = crm_activity_merge_changes(
-        crm_activity_list_since($conn, $since, 80),
-        sync_changes_from_serials($conn, $since),
-        50
-    );
+    $activity = crm_activity_list_since($conn, $since, 80);
+    crm_debug_mark('sync_activity_list', count($activity) . ' rows');
+    $serialChanges = sync_changes_from_serials($conn, $since);
+    crm_debug_mark('sync_serial_changes', count($serialChanges) . ' rows');
+    $changes = crm_activity_merge_changes($activity, $serialChanges, 50);
+    crm_debug_mark('sync_merge_changes', count($changes) . ' merged');
     json_out([
         'serverTime' => $now,
         'cursor' => $now,
@@ -203,6 +210,7 @@ if ($path === '/stats/registrations-by-day' && $method === 'GET') {
             }
             $stmt->close();
         }
+        crm_debug_mark('chart_jalali_group_by', count($counts) . ' days');
     }
 
     // 2) Legacy rows: only `time` (Gregorian) — convert day → Jalali for the chart
@@ -243,6 +251,7 @@ if ($path === '/stats/registrations-by-day' && $method === 'GET') {
             }
             $stmt->close();
         }
+        crm_debug_mark('chart_time_group_by', count($counts) . ' days total');
     }
 
     $days = [];
@@ -261,6 +270,7 @@ if ($path === '/stats/registrations-by-day' && $method === 'GET') {
             $days[] = ['day' => $key, 'count' => $counts[$key]];
         }
     }
+    crm_debug_mark('chart_axis_build', count($days) . ' axis points');
     json_out(['from' => $from, 'to' => $to, 'days' => $days]);
 }
 
@@ -448,6 +458,7 @@ if ($path === '/serials' && $method === 'GET') {
         $rawRows[] = $row;
     }
     $stmt->close();
+    crm_debug_mark('serials_list_query', count($rawRows) . ' rows page=' . $page);
 
     if (
         serial_list_uses_cached_total(
@@ -462,6 +473,7 @@ if ($path === '/serials' && $method === 'GET') {
         )
     ) {
         $total = serial_cached_stats($conn, $table)['registered'];
+        crm_debug_mark('serials_count_cached', 'total=' . $total);
     } else {
         $countSql = "SELECT COUNT(*) AS c FROM `$table` WHERE $whereSql";
         if ($types !== '') {
@@ -473,6 +485,7 @@ if ($path === '/serials' && $method === 'GET') {
         } else {
             $total = (int) ($conn->query($countSql)->fetch_assoc()['c'] ?? 0);
         }
+        crm_debug_mark('serials_count_sql', 'total=' . $total);
     }
 
     $phones = [];
@@ -487,8 +500,10 @@ if ($path === '/serials' && $method === 'GET') {
         }
     }
     $knownByPhone = serial_known_cities_for_phones($conn, $phones, $excludeSerialByPhone);
+    crm_debug_mark('serials_known_cities', count($knownByPhone) . ' phones');
     require_once __DIR__ . '/bots_store.php';
     $pairing = bots_pairing_map_for_phones($conn, $phones);
+    crm_debug_mark('serials_bot_pairing', count($phones) . ' phones');
     $smsProcessing['__pairing'] = $pairing;
     $items = [];
     foreach ($rawRows as $row) {
@@ -496,6 +511,7 @@ if ($path === '/serials' && $method === 'GET') {
         $known = $p !== '' ? ($knownByPhone[$p] ?? null) : null;
         $items[] = row_to_serial($row, $smsProcessing, $known);
     }
+    crm_debug_mark('serials_row_map', count($items) . ' items');
     json_out(['items' => $items, 'total' => $total, 'page' => $page, 'limit' => $limit]);
 }
 
@@ -790,6 +806,7 @@ if ($path === '/serial-errors/clients' && $method === 'GET') {
     $page = max(1, (int) ($_GET['page'] ?? 1));
     $limit = max(1, min(100, (int) ($_GET['limit'] ?? 9)));
     $result = sre_list_clients($conn, $page, $limit);
+    crm_debug_mark('serial_errors_clients', count($result['items']) . ' items total=' . $result['total']);
     json_out([
         'items' => $result['items'],
         'total' => $result['total'],
