@@ -102,7 +102,7 @@ if ($path === '/debug/db' && $method === 'GET') {
             ? 'fastcgi'
             : (function_exists('litespeed_finish_request') ? 'litespeed' : 'none'),
         'autoIndex' => [
-            'done' => crm_cache_get('perf_index_auto_done', 86400) !== null,
+            'done' => crm_cache_get(crm_perf_index_done_key(), 86400) !== null,
             'building' => crm_cache_get('perf_index_auto_building', 900) !== null,
             'failed' => crm_cache_get('perf_index_auto_failed', 3600),
         ],
@@ -137,7 +137,7 @@ if ($path === '/debug/add-index' && $method === 'POST') {
     if ($result['ok']) {
         crm_cache_delete('perf_index_auto_failed');
         if ($result['remaining'] === 0) {
-            crm_cache_set('perf_index_auto_done', ['at' => time()]);
+            crm_cache_set(crm_perf_index_done_key(), ['at' => time()]);
         }
     }
     json_out($result + ['indexes' => serial_perf_index_status($conn, $table)]);

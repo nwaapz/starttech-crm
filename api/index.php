@@ -436,6 +436,18 @@ if ($path === '/serials' && $method === 'GET') {
     }
 
     $order = serial_list_order_sql($conn, $table, $registeredParam === 'true');
+    // Optimizer picks idx_serials_phone (~50k row lookups + filesort, ~20s here). For broad lists,
+    // walking the ORDER BY index backwards stops after LIMIT rows. Selective filters keep the optimizer's choice.
+    $indexHint = '';
+    if (
+        $registeredParam === 'true'
+        && $search === ''
+        && $groupIds === []
+        && $provinceId === ''
+        && serial_table_has_index($conn, $table, 'idx_serials_reg_date')
+    ) {
+        $indexHint = 'FORCE INDEX (idx_serials_reg_date)';
+    }
     $baseWhere = $where;
     $baseTypes = $types;
     $baseParams = $params;
@@ -452,8 +464,8 @@ if ($path === '/serials' && $method === 'GET') {
         }
         return [implode(' AND ', $w), $t, $p];
     };
-    $runList = static function (string $whereSql, string $types, array $params) use ($conn, $table, $order, $limit, $offset): array {
-        $stmt = $conn->prepare("SELECT * FROM `$table` WHERE $whereSql $order LIMIT ? OFFSET ?");
+    $runList = static function (string $whereSql, string $types, array $params) use ($conn, $table, $order, $limit, $offset, $indexHint): array {
+        $stmt = $conn->prepare("SELECT * FROM `$table` $indexHint WHERE $whereSql $order LIMIT ? OFFSET ?");
         if (!$stmt) {
             json_error('DB prepare failed: ' . $conn->error, 500);
         }
@@ -468,7 +480,7 @@ if ($path === '/serials' && $method === 'GET') {
         }
         $stmt->close();
         if (crm_debug_enabled()) {
-            crm_debug_mark('serials_list_plan', $order . ' | ' . crm_debug_explain($conn, "SELECT * FROM `$table` WHERE $whereSql $order LIMIT ? OFFSET ?", $types2, $params2));
+            crm_debug_mark('serials_list_plan', trim($indexHint . ' ' . $order) . ' | ' . crm_debug_explain($conn, "SELECT * FROM `$table` $indexHint WHERE $whereSql $order LIMIT ? OFFSET ?", $types2, $params2));
         }
         return $rows;
     };

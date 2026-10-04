@@ -582,10 +582,37 @@ function is_registered_sql(string $alias = ''): string {
     return "({$p}phone IS NOT NULL AND {$p}phone <> '' AND {$p}phone <> '0')";
 }
 
-/** @return array<string,array{column:string,def:string}> */
+function serial_table_has_index(mysqli $conn, string $table, string $indexName): bool
+{
+    static $cache = [];
+    $k = $table . '|' . $indexName;
+    if (!isset($cache[$k])) {
+        $t = $conn->real_escape_string($table);
+        $i = $conn->real_escape_string($indexName);
+        $r = $conn->query("SHOW INDEX FROM `$t` WHERE Key_name = '$i'");
+        $cache[$k] = $r && $r->num_rows > 0;
+    }
+    return $cache[$k];
+}
+
+/** Changes whenever the index list changes, so new indexes get auto-built. */
+function crm_perf_index_done_key(): string
+{
+    return 'perf_index_auto_done_' . md5((string) json_encode(serial_perf_index_defs()));
+}
+
+/** @return array<string,array{column:string,def:string,exact?:bool,requires?:list<string>}> */
 function serial_perf_index_defs(): array
 {
     return [
+        // Matches the registered-list ORDER BY so LIMIT 50 reads 50 index entries, not a filesort.
+        // exact: the date_jalali(10) prefix index can't serve ORDER BY, so don't count it as cover.
+        'idx_serials_reg_date' => [
+            'column' => 'date_jalali',
+            'def' => 'date_jalali, time',
+            'exact' => true,
+            'requires' => ['date_jalali', 'time'],
+        ],
         'idx_serials_serial' => ['column' => 'serial', 'def' => 'serial'],
         'idx_serials_phone' => ['column' => 'phone', 'def' => 'phone'],
         'idx_serials_sync_updated_ms' => ['column' => 'sync_updated_ms', 'def' => 'sync_updated_ms'],
@@ -623,13 +650,25 @@ function serial_perf_index_status(mysqli $conn, string $table): array
     }
     $out = [];
     foreach (serial_perf_index_defs() as $name => $d) {
-        $coveredBy = isset($existing[$name]) ? $name : ($leadingColumns[strtolower($d['column'])] ?? null);
+        if (isset($existing[$name])) {
+            $coveredBy = $name;
+        } elseif (!empty($d['exact'])) {
+            $coveredBy = null;
+        } else {
+            $coveredBy = $leadingColumns[strtolower($d['column'])] ?? null;
+        }
+        $applicable = true;
+        foreach ($d['requires'] ?? [$d['column']] as $col) {
+            if (!isset($columns[$col])) {
+                $applicable = false;
+            }
+        }
         $out[] = [
             'name' => $name,
             'def' => $d['def'],
             'present' => $coveredBy !== null,
             'coveredBy' => $coveredBy,
-            'applicable' => isset($columns[$d['column']]),
+            'applicable' => $applicable,
         ];
     }
     return $out;
@@ -724,7 +763,7 @@ function serial_search_filter(string $search, bool $fast): ?array
  */
 function crm_schedule_perf_index_build(mysqli $conn): void
 {
-    $doneKey = 'perf_index_auto_done';
+    $doneKey = crm_perf_index_done_key();
     $lockKey = 'perf_index_auto_building';
     $failKey = 'perf_index_auto_failed';
     $canFinishEarly = function_exists('fastcgi_finish_request') || function_exists('litespeed_finish_request');

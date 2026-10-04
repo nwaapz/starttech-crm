@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS old_serials (
   UNIQUE KEY uq_old_serials_serial (serial),
   KEY idx_serials_phone (phone),
   KEY idx_serials_date_jalali (date_jalali(10)),
+  KEY idx_serials_reg_date (date_jalali, time),
   KEY idx_serials_time (time),
   KEY idx_serials_sync_updated_ms (sync_updated_ms),
   KEY idx_serials_reg_source (reg_source),
