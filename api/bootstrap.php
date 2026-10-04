@@ -135,6 +135,35 @@ function crm_debug_payload(): ?array
     ];
 }
 
+/** One-line EXPLAIN summary (index used, rows examined, extra) for the debug panel. */
+function crm_debug_explain(mysqli $conn, string $sql, string $types = '', array $params = []): string
+{
+    $stmt = $conn->prepare('EXPLAIN ' . $sql);
+    if (!$stmt) {
+        return 'explain failed: ' . $conn->error;
+    }
+    if ($types !== '') {
+        $stmt->bind_param($types, ...$params);
+    }
+    if (!$stmt->execute()) {
+        $err = $stmt->error;
+        $stmt->close();
+        return 'explain failed: ' . $err;
+    }
+    $parts = [];
+    foreach (stmt_fetch_all_assoc($stmt) as $row) {
+        $parts[] = sprintf(
+            'type=%s key=%s rows=%s extra=%s',
+            $row['type'] ?? '?',
+            ($row['key'] ?? '') !== '' && $row['key'] !== null ? $row['key'] : 'NONE',
+            $row['rows'] ?? '?',
+            $row['Extra'] ?? ''
+        );
+    }
+    $stmt->close();
+    return implode(' ; ', $parts);
+}
+
 function crm_debug_attach(array $data): array
 {
     $dbg = crm_debug_payload();

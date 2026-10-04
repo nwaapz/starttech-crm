@@ -467,6 +467,9 @@ if ($path === '/serials' && $method === 'GET') {
             $rows[] = $row;
         }
         $stmt->close();
+        if (crm_debug_enabled()) {
+            crm_debug_mark('serials_list_plan', $order . ' | ' . crm_debug_explain($conn, "SELECT * FROM `$table` WHERE $whereSql $order LIMIT ? OFFSET ?", $types2, $params2));
+        }
         return $rows;
     };
 
