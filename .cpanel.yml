@@ -1,7 +1,6 @@
 ---
 deployment:
   tasks:
-    - export DEPLOYPATH=$HOME/public_html/crm/
-    - /bin/mkdir -p $DEPLOYPATH
-    - /bin/rm -rf ${DEPLOYPATH}assets
-    - /bin/cp -R index.html .htaccess assets api cron install $DEPLOYPATH
+    - /bin/mkdir -p /home3/startech/public_html/crm
+    - /bin/rm -rf /home3/startech/public_html/crm/assets
+    - /bin/cp -R index.html .htaccess assets api cron install /home3/startech/public_html/crm/
