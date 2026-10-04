@@ -171,6 +171,19 @@ function sw_record_group_delete_tombstone(
 /** Ensure inventory columns used by remote serial generation exist. */
 function sw_ensure_columns(mysqli $conn, string $table): void
 {
+    static $done = [];
+    if (isset($done[$table])) {
+        return;
+    }
+    $done[$table] = true;
+    // Backfills below scan the whole serials table; claim the slot before running so
+    // parallel requests don't stack full-table UPDATEs on each other.
+    $cacheKey = 'sw_columns_' . $table . '_' . md5(__FILE__ . '|' . (string) @filemtime(__FILE__));
+    if (crm_cache_get($cacheKey, 3600) !== null) {
+        return;
+    }
+    crm_cache_set($cacheKey, ['at' => time()]);
+
     sw_ensure_serial_groups_table($conn);
     $adds = [
         'city' => "VARCHAR(100) DEFAULT NULL",
@@ -190,8 +203,6 @@ function sw_ensure_columns(mysqli $conn, string $table): void
             $conn->query("ALTER TABLE `$table` ADD COLUMN `$col` $def");
         }
     }
-    serial_ensure_perf_indexes($conn, $table);
-
     // Backfill timestamps so unused + registered rows are pullable on first sync.
     // Invalid/zero MySQL dates make UNIX_TIMESTAMP NULL — fall back to row id.
     if (column_exists($conn, $table, 'sync_updated_ms')) {
@@ -206,7 +217,7 @@ function sw_ensure_columns(mysqli $conn, string $table): void
         // inventory before old registrations. Also fixes rows wrongly stamped with NOW().
         @$conn->query(
             "UPDATE `$table` SET sync_updated_ms = (1000000000000 + id)
-             WHERE (phone IS NULL OR TRIM(phone) = '')
+             WHERE (phone IS NULL OR phone = '')
                AND (
                  sync_updated_ms IS NULL OR sync_updated_ms = 0
                  OR sync_updated_ms > 1700000000000

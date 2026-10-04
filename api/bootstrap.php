@@ -207,10 +207,68 @@ function column_exists(mysqli $conn, string $table, string $col): bool {
     return $r && $r->num_rows > 0;
 }
 
+function crm_cache_dir(): string
+{
+    static $dir = null;
+    if ($dir !== null) {
+        return $dir;
+    }
+    $candidates = [dirname(__DIR__) . '/storage/cache', sys_get_temp_dir() . '/crm_cache_' . md5(__DIR__)];
+    foreach ($candidates as $c) {
+        if (is_dir($c) || @mkdir($c, 0775, true)) {
+            if (is_writable($c)) {
+                return $dir = $c;
+            }
+        }
+    }
+    return $dir = '';
+}
+
+/** @return mixed|null */
+function crm_cache_get(string $key, int $ttlSeconds)
+{
+    $dir = crm_cache_dir();
+    if ($dir === '') {
+        return null;
+    }
+    $file = $dir . '/' . preg_replace('/[^a-z0-9_.-]/i', '_', $key) . '.json';
+    $mtime = @filemtime($file);
+    if ($mtime === false || (time() - $mtime) >= $ttlSeconds) {
+        return null;
+    }
+    $raw = @file_get_contents($file);
+    if ($raw === false) {
+        return null;
+    }
+    $data = json_decode($raw, true);
+    return $data === null ? null : $data;
+}
+
+/** @param mixed $value */
+function crm_cache_set(string $key, $value): void
+{
+    $dir = crm_cache_dir();
+    if ($dir === '') {
+        return;
+    }
+    $file = $dir . '/' . preg_replace('/[^a-z0-9_.-]/i', '_', $key) . '.json';
+    @file_put_contents($file, json_encode($value), LOCK_EX);
+}
+
+function crm_schema_cache_key(): string
+{
+    return 'schema_ok_' . md5(__FILE__ . '|' . (string) @filemtime(__FILE__));
+}
+
 /** Ensure session + additive columns needed by the remote panel. */
 function ensure_remote_schema(mysqli $conn): void {
     static $ready = false;
     if ($ready) {
+        return;
+    }
+    // Schema DDL is idempotent but costs dozens of metadata queries; run at most hourly per deploy.
+    if (crm_cache_get(crm_schema_cache_key(), 3600) !== null) {
+        $ready = true;
         return;
     }
     $ok = $conn->query(
@@ -307,13 +365,7 @@ function ensure_remote_schema(mysqli $conn): void {
         }
     }
 
-    if (table_exists($conn, 'old_serials')) {
-        serial_ensure_perf_indexes($conn, 'old_serials');
-    }
-    if (table_exists($conn, 'new_serials')) {
-        serial_ensure_perf_indexes($conn, 'new_serials');
-    }
-
+    crm_cache_set(crm_schema_cache_key(), ['at' => time()]);
     $ready = true;
 }
 
@@ -440,48 +492,89 @@ function is_registered_sql(string $alias = ''): string {
     return "({$p}phone IS NOT NULL AND {$p}phone <> '' AND {$p}phone <> '0')";
 }
 
-/** Add indexes used by list/report/sync queries (idempotent). */
-function serial_ensure_perf_indexes(mysqli $conn, string $table): void
+/** @return array<string,array{column:string,def:string}> */
+function serial_perf_index_defs(): array
 {
-    static $done = [];
-    if (isset($done[$table])) {
-        return;
-    }
-    $done[$table] = true;
-
-    $indexes = [
-        'idx_serials_phone' => 'phone',
-        'idx_serials_date_jalali' => 'date_jalali(10)',
-        'idx_serials_time' => 'time',
-        'idx_serials_sync_updated_ms' => 'sync_updated_ms',
-        'idx_serials_reg_source' => 'reg_source',
-        'idx_serials_lan_group' => 'lan_group_id',
+    return [
+        'idx_serials_phone' => ['column' => 'phone', 'def' => 'phone'],
+        'idx_serials_sync_updated_ms' => ['column' => 'sync_updated_ms', 'def' => 'sync_updated_ms'],
+        'idx_serials_date_jalali' => ['column' => 'date_jalali', 'def' => 'date_jalali(10)'],
+        'idx_serials_time' => ['column' => 'time', 'def' => 'time'],
+        'idx_serials_reg_source' => ['column' => 'reg_source', 'def' => 'reg_source'],
+        'idx_serials_lan_group' => ['column' => 'lan_group_id', 'def' => 'lan_group_id'],
     ];
-    foreach ($indexes as $name => $cols) {
-        if ($cols === 'date_jalali(10)' && !column_exists($conn, $table, 'date_jalali')) {
-            continue;
-        }
-        if ($cols === 'time' && !column_exists($conn, $table, 'time')) {
-            continue;
-        }
-        if ($cols === 'sync_updated_ms' && !column_exists($conn, $table, 'sync_updated_ms')) {
-            continue;
-        }
-        if ($cols === 'reg_source' && !column_exists($conn, $table, 'reg_source')) {
-            continue;
-        }
-        if ($cols === 'lan_group_id' && !column_exists($conn, $table, 'lan_group_id')) {
-            continue;
-        }
-        if ($cols === 'phone' && !column_exists($conn, $table, 'phone')) {
-            continue;
-        }
-        $escaped = $conn->real_escape_string($name);
-        $idx = $conn->query("SHOW INDEX FROM `$table` WHERE Key_name = '$escaped'");
-        if ($idx && $idx->num_rows === 0) {
-            @$conn->query("ALTER TABLE `$table` ADD INDEX `$name` ($cols)");
+}
+
+/**
+ * Which perf indexes exist / are missing. Never runs DDL.
+ *
+ * @return list<array{name:string,def:string,present:bool,applicable:bool}>
+ */
+function serial_perf_index_status(mysqli $conn, string $table): array
+{
+    $existing = [];
+    $res = $conn->query("SHOW INDEX FROM `$table`");
+    if ($res) {
+        while ($row = $res->fetch_assoc()) {
+            $existing[(string) $row['Key_name']] = true;
         }
     }
+    $columns = [];
+    $res = $conn->query("SHOW COLUMNS FROM `$table`");
+    if ($res) {
+        while ($row = $res->fetch_assoc()) {
+            $columns[(string) $row['Field']] = true;
+        }
+    }
+    $out = [];
+    foreach (serial_perf_index_defs() as $name => $d) {
+        $out[] = [
+            'name' => $name,
+            'def' => $d['def'],
+            'present' => isset($existing[$name]),
+            'applicable' => isset($columns[$d['column']]),
+        ];
+    }
+    return $out;
+}
+
+/**
+ * Build ONE missing perf index. Index DDL on a big table must never run inside normal
+ * page requests: concurrent ALTERs queue on the table metadata lock and stall every query.
+ * lock_wait_timeout keeps a blocked ALTER from freezing other requests for long.
+ *
+ * @return array{ok:bool,name?:string,ms?:float,error?:string,remaining:int}
+ */
+function serial_add_next_perf_index(mysqli $conn, string $table): array
+{
+    $missing = array_values(array_filter(
+        serial_perf_index_status($conn, $table),
+        static fn ($i) => $i['applicable'] && !$i['present']
+    ));
+    if ($missing === []) {
+        return ['ok' => true, 'remaining' => 0];
+    }
+    $next = $missing[0];
+    @set_time_limit(0);
+    @ignore_user_abort(true);
+    $conn->query('SET SESSION lock_wait_timeout = 5');
+    $t0 = microtime(true);
+    $sql = "ALTER TABLE `$table` ADD INDEX `{$next['name']}` ({$next['def']}), ALGORITHM=INPLACE, LOCK=NONE";
+    $ok = $conn->query($sql);
+    if ($ok === false) {
+        return [
+            'ok' => false,
+            'name' => $next['name'],
+            'error' => $conn->error,
+            'remaining' => count($missing),
+        ];
+    }
+    return [
+        'ok' => true,
+        'name' => $next['name'],
+        'ms' => round((microtime(true) - $t0) * 1000, 1),
+        'remaining' => count($missing) - 1,
+    ];
 }
 
 /** Fast ORDER BY for paginated serial lists (uses sync_updated_ms or time index). */
@@ -512,8 +605,18 @@ function serial_cached_stats(mysqli $conn, string $table, bool $refresh = false)
     ) {
         return $cache[$table]['stats'];
     }
+    $cacheKey = 'serial_stats_' . $table;
+    $fileCached = crm_cache_get($cacheKey, $refresh ? 10 : 30);
+    if (is_array($fileCached) && isset($fileCached['total'], $fileCached['registered'])) {
+        $stats = [
+            'total' => (int) $fileCached['total'],
+            'registered' => (int) $fileCached['registered'],
+            'unused' => max(0, (int) $fileCached['total'] - (int) $fileCached['registered']),
+        ];
+        $cache[$table] = ['at' => $now, 'stats' => $stats];
+        return $stats;
+    }
 
-    serial_ensure_perf_indexes($conn, $table);
     $registeredSql = is_registered_sql();
     $res = $conn->query(
         "SELECT COUNT(*) AS total,
@@ -532,6 +635,7 @@ function serial_cached_stats(mysqli $conn, string $table, bool $refresh = false)
         'unused' => max(0, $total - $registered),
     ];
     $cache[$table] = ['at' => $now, 'stats' => $stats];
+    crm_cache_set($cacheKey, $stats);
     return $stats;
 }
 

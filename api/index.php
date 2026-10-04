@@ -77,6 +77,10 @@ if (
 crm_debug_mark('bootstrap_loaded');
 $conn = payamesh_mysqli();
 crm_debug_mark('db_connect');
+if (starts_with($path, '/debug/')) {
+    require __DIR__ . '/debug_db.php';
+    exit;
+}
 ensure_remote_schema($conn);
 crm_debug_mark('ensure_remote_schema');
 
@@ -189,7 +193,6 @@ if ($path === '/stats/registrations-by-day' && $method === 'GET') {
     $counts = [];
 
     // 1) Rows that already have Jalali date_jalali
-    serial_ensure_perf_indexes($conn, $table);
     if ($hasJalali) {
         $sql = "SELECT LEFT(date_jalali, 10) AS day, COUNT(*) AS c
                 FROM `$table`
@@ -340,8 +343,6 @@ if ($path === '/serials' && $method === 'GET') {
     if ($provinceId === '') {
         $cityName = '';
     }
-
-    serial_ensure_perf_indexes($conn, $table);
 
     $where = ['1=1'];
     $types = '';
