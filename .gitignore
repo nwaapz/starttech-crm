@@ -1,0 +1,6 @@
+# Server-owned — never deployed or overwritten
+config/
+storage/
+get_verif.php
+error_log
+*.log

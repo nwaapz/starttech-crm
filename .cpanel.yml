@@ -1,0 +1,7 @@
+---
+deployment:
+  tasks:
+    - export DEPLOYPATH=$HOME/public_html/crm/
+    - /bin/mkdir -p $DEPLOYPATH
+    - /bin/rm -rf ${DEPLOYPATH}assets
+    - /bin/cp -R index.html .htaccess assets api cron install $DEPLOYPATH

@@ -1,0 +1,7 @@
+# Allow direct PHP webhook scripts (not only index.php front controller)
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  # If requesting an existing file (telegram.php / bale.php), serve it
+  RewriteCond %{REQUEST_FILENAME} -f
+  RewriteRule ^ - [L]
+</IfModule>

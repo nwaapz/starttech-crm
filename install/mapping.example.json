@@ -1,0 +1,37 @@
+{
+  "source": {
+    "host": "localhost",
+    "username": "root",
+    "password": "",
+    "database": "their_old_crm"
+  },
+  "target": {
+    "host": "localhost",
+    "username": "root",
+    "password": "",
+    "database": "payamesh_crm"
+  },
+  "dryRun": true,
+  "tables": [
+    {
+      "target": "old_serials",
+      "from": "warranty_codes",
+      "columns": {
+        "serial": "code_number",
+        "phone": "mobile",
+        "km": "mileage",
+        "city": "town",
+        "time": "registered_at"
+      }
+    },
+    {
+      "target": "users",
+      "from": "admins",
+      "columns": {
+        "name": "login",
+        "pass": "password_hash",
+        "role": "role_id"
+      }
+    }
+  ]
+}
