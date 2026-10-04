@@ -435,7 +435,7 @@ if ($path === '/serials' && $method === 'GET') {
         $params[] = $p;
     }
 
-    $order = serial_list_order_sql($conn, $table);
+    $order = serial_list_order_sql($conn, $table, $registeredParam === 'true');
     $baseWhere = $where;
     $baseTypes = $types;
     $baseParams = $params;

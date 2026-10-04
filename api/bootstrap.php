@@ -723,9 +723,27 @@ function crm_schedule_perf_index_build(mysqli $conn): void
     });
 }
 
-/** Fast ORDER BY for paginated serial lists (uses sync_updated_ms or time index). */
-function serial_list_order_sql(mysqli $conn, string $table): string
+/**
+ * ORDER BY for paginated serial lists.
+ * Registered rows: registration date (what the UI shows), index-friendly on date_jalali/time.
+ * Inventory / unused: last sync stamp so freshly generated stock surfaces first.
+ */
+function serial_list_order_sql(mysqli $conn, string $table, bool $byRegistrationDate = false): string
 {
+    if ($byRegistrationDate) {
+        $hasJalali = column_exists($conn, $table, 'date_jalali');
+        $hasTime = column_exists($conn, $table, 'time');
+        if ($hasJalali && $hasTime) {
+            return 'ORDER BY date_jalali DESC, time DESC, id DESC';
+        }
+        if ($hasJalali) {
+            return 'ORDER BY date_jalali DESC, id DESC';
+        }
+        if ($hasTime) {
+            return 'ORDER BY time DESC, id DESC';
+        }
+        return 'ORDER BY id DESC';
+    }
     if (column_exists($conn, $table, 'sync_updated_ms')) {
         return 'ORDER BY sync_updated_ms DESC, id DESC';
     }
