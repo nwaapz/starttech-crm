@@ -435,18 +435,16 @@ if ($path === '/serials' && $method === 'GET') {
         $params[] = $p;
     }
 
-    $order = serial_list_order_sql($conn, $table, $registeredParam === 'true');
-    // Optimizer picks idx_serials_phone (~50k row lookups + filesort, ~20s here). For broad lists,
-    // walking the ORDER BY index backwards stops after LIMIT rows. Selective filters keep the optimizer's choice.
-    $indexHint = '';
-    if (
-        $registeredParam === 'true'
-        && $search === ''
-        && $groupIds === []
-        && $provinceId === ''
-        && serial_table_has_index($conn, $table, 'idx_serials_reg_date')
-    ) {
-        $indexHint = 'FORCE INDEX (idx_serials_reg_date)';
+    // Broad registered lists sorted by date need idx_serials_reg_date: without it MySQL does ~50k row
+    // lookups + filesort (~20s on this host), so fall back to the sync-stamp order until it exists.
+    // Selective filters keep date order and the optimizer's own index choice.
+    $broadRegisteredList = $registeredParam === 'true' && $search === '' && $groupIds === [] && $provinceId === '';
+    $hasRegDateIndex = $broadRegisteredList && serial_table_has_index($conn, $table, 'idx_serials_reg_date');
+    $sortByDate = $registeredParam === 'true' && (!$broadRegisteredList || $hasRegDateIndex);
+    $order = serial_list_order_sql($conn, $table, $sortByDate);
+    $indexHint = $hasRegDateIndex ? 'FORCE INDEX (idx_serials_reg_date)' : '';
+    if ($broadRegisteredList && !$hasRegDateIndex) {
+        crm_debug_mark('serials_order_fallback', 'idx_serials_reg_date missing — using sync order');
     }
     $baseWhere = $where;
     $baseTypes = $types;
