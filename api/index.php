@@ -481,8 +481,11 @@ if ($path === '/serials' && $method === 'GET') {
             [$whereSql, $types, $params] = $applySearch($fastFilter);
             $rawRows = $runList($whereSql, $types, $params);
             $searchMode = 'prefix';
+            crm_debug_mark('serials_search_prefix', count($rawRows) . ' rows');
         }
-        $useSubstring = $rawRows === [];
+        // A full serial ("S410390") can't match mid-string, so the full-scan fallback is pointless.
+        $looksLikeFullSerial = (bool) preg_match('/^[A-Za-z]+[0-9۰-۹٠-٩]{4,}$/u', trim($search));
+        $useSubstring = $rawRows === [] && !$looksLikeFullSerial;
         if ($useSubstring && $fastFilter !== null && $page > 1) {
             // Empty later page: only switch modes if the prefix search had no matches at all.
             $probe = $conn->prepare("SELECT 1 FROM `$table` WHERE $whereSql LIMIT 1");
@@ -499,6 +502,7 @@ if ($path === '/serials' && $method === 'GET') {
             [$whereSql, $types, $params] = $applySearch(serial_search_filter($search, false));
             $rawRows = $runList($whereSql, $types, $params);
             $searchMode = 'substring';
+            crm_debug_mark('serials_search_substring', count($rawRows) . ' rows');
         }
     }
     require_once __DIR__ . '/settings_store.php';
