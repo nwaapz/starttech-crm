@@ -203,6 +203,14 @@ function sw_ensure_columns(mysqli $conn, string $table): void
             $conn->query("ALTER TABLE `$table` ADD COLUMN `$col` $def");
         }
     }
+    crm_defer(static function () use ($conn, $table): void {
+        sw_run_full_table_backfills($conn, $table);
+    });
+}
+
+/** Full-table maintenance; always run deferred (after the response is sent). */
+function sw_run_full_table_backfills(mysqli $conn, string $table): void
+{
     // Backfill timestamps so unused + registered rows are pullable on first sync.
     // Invalid/zero MySQL dates make UNIX_TIMESTAMP NULL — fall back to row id.
     if (column_exists($conn, $table, 'sync_updated_ms')) {
@@ -709,8 +717,9 @@ function sw_append_legacy_inventory_cards(
 }
 
 /**
- * Per-group and legacy (ungrouped) serial counts from ONE table scan, cached 2 min.
- * Cache key includes the serial_groups signature so creating/deleting a card refreshes it.
+ * Per-group and legacy (ungrouped) serial counts from ONE table scan, fresh for 2 min.
+ * Older snapshots are served immediately and recomputed after the response; a changed
+ * serial_groups signature (card created/deleted) also triggers a refresh.
  *
  * @return array{groups:array<int,array{total:int,used:int}>,legacy:?list<array{category:string,total:int,used:int}>,cached?:bool}
  */
@@ -724,16 +733,79 @@ function sw_group_count_snapshot(mysqli $conn, string $table): array
     if ($r && ($row = $r->fetch_assoc())) {
         $sig = $row['c'] . ':' . $row['m'];
     }
-    $cacheKey = 'serial_group_counts_' . $table . '_' . md5($sig);
-    $cached = crm_cache_get($cacheKey, 120);
-    if (is_array($cached) && isset($cached['groups'])) {
-        $groups = [];
-        foreach ($cached['groups'] as $gid => $c) {
-            $groups[(int) $gid] = $c;
-        }
-        return ['groups' => $groups, 'legacy' => $cached['legacy'] ?? [], 'cached' => true];
+    $cacheKey = 'serial_group_counts_' . $table;
+    $lockKey = $cacheKey . '_refreshing';
+
+    $fresh = crm_cache_get($cacheKey, 120);
+    if (is_array($fresh) && isset($fresh['groups']) && ($fresh['sig'] ?? '') === $sig) {
+        return sw_group_snapshot_from_cache($fresh) + ['cached' => true];
     }
 
+    // Full count scan takes ~1 min on this host: serve the last snapshot and refresh after
+    // the response. Only a cold cache (first run ever) scans synchronously.
+    $stale = crm_cache_get($cacheKey, 7 * 86400);
+    if (!is_array($stale)) {
+        $stale = crm_cache_get($cacheKey . '_' . md5($sig), 7 * 86400);
+    }
+    if (is_array($stale) && isset($stale['groups'])) {
+        if (crm_cache_get($lockKey, 600) === null) {
+            crm_cache_set($lockKey, ['at' => time()]);
+            crm_defer(static function () use ($conn, $table, $cacheKey, $lockKey, $sig): void {
+                sw_group_count_compute($conn, $table, $cacheKey, $sig);
+                crm_cache_delete($lockKey);
+            });
+        }
+        $snap = sw_group_snapshot_from_cache($stale);
+        if (($stale['sig'] ?? '') !== $sig) {
+            sw_group_counts_fill_missing($conn, $table, $snap['groups']);
+        }
+        return $snap + ['cached' => true];
+    }
+
+    return sw_group_count_compute($conn, $table, $cacheKey, $sig);
+}
+
+/** @return array{groups:array<int,array{total:int,used:int}>,legacy:list<array{category:string,total:int,used:int}>} */
+function sw_group_snapshot_from_cache(array $cached): array
+{
+    $groups = [];
+    foreach ($cached['groups'] as $gid => $c) {
+        $groups[(int) $gid] = ['total' => (int) ($c['total'] ?? 0), 'used' => (int) ($c['used'] ?? 0)];
+    }
+    return ['groups' => $groups, 'legacy' => $cached['legacy'] ?? []];
+}
+
+/** Count cards created since the cached snapshot (indexed by lan_group_id). */
+function sw_group_counts_fill_missing(mysqli $conn, string $table, array &$groups): void
+{
+    $ids = [];
+    $res = $conn->query('SELECT id FROM serial_groups');
+    if ($res) {
+        while ($row = $res->fetch_assoc()) {
+            $gid = (int) $row['id'];
+            if (!isset($groups[$gid])) {
+                $ids[] = $gid;
+            }
+        }
+    }
+    if ($ids === []) {
+        return;
+    }
+    $reg = is_registered_sql();
+    $res = $conn->query(
+        "SELECT lan_group_id AS gid, COUNT(*) AS total, SUM(CASE WHEN $reg THEN 1 ELSE 0 END) AS used
+         FROM `$table` WHERE lan_group_id IN (" . implode(',', $ids) . ') GROUP BY lan_group_id'
+    );
+    if ($res) {
+        while ($row = $res->fetch_assoc()) {
+            $groups[(int) $row['gid']] = ['total' => (int) $row['total'], 'used' => (int) $row['used']];
+        }
+    }
+}
+
+/** @return array{groups:array<int,array{total:int,used:int}>,legacy:list<array{category:string,total:int,used:int}>} */
+function sw_group_count_compute(mysqli $conn, string $table, string $cacheKey, string $sig): array
+{
     $reg = is_registered_sql('t');
     $catExpr = column_exists($conn, $table, 'category') ? 't.category' : "'end_user_client'";
     $res = $conn->query(
@@ -770,7 +842,9 @@ function sw_group_count_snapshot(mysqli $conn, string $table): array
         }
     }
     $legacy = array_values($legacyByCat);
-    crm_cache_set($cacheKey, ['groups' => $groups, 'legacy' => $legacy]);
+    if ($res) {
+        crm_cache_set($cacheKey, ['groups' => $groups, 'legacy' => $legacy, 'sig' => $sig]);
+    }
     return ['groups' => $groups, 'legacy' => $legacy];
 }
 

@@ -145,13 +145,63 @@ function crm_debug_attach(array $data): array
     return $data;
 }
 
+$GLOBALS['crm_deferred'] = [];
+
+/** Run $fn after the response has been sent (slow maintenance must not block the user). */
+function crm_defer(callable $fn): void
+{
+    $GLOBALS['crm_deferred'][] = $fn;
+}
+
+function crm_has_deferred(): bool
+{
+    return !empty($GLOBALS['crm_deferred']);
+}
+
+function crm_run_deferred(): void
+{
+    $tasks = $GLOBALS['crm_deferred'] ?? [];
+    if ($tasks === []) {
+        return;
+    }
+    $GLOBALS['crm_deferred'] = [];
+    @ignore_user_abort(true);
+    @set_time_limit(600);
+    if (function_exists('fastcgi_finish_request')) {
+        fastcgi_finish_request();
+    } elseif (function_exists('litespeed_finish_request')) {
+        litespeed_finish_request();
+    } else {
+        while (ob_get_level() > 0) {
+            @ob_end_flush();
+        }
+        flush();
+    }
+    foreach ($tasks as $fn) {
+        try {
+            $fn();
+        } catch (Throwable $e) {
+            error_log('[crm deferred] ' . $e->getMessage());
+        }
+    }
+}
+
+register_shutdown_function('crm_run_deferred');
+
 function json_out($data, int $code = 200): void {
     http_response_code($code);
     header('Content-Type: application/json; charset=utf-8');
     if (is_array($data)) {
         $data = crm_debug_attach($data);
     }
-    echo json_encode($data, JSON_UNESCAPED_UNICODE);
+    $json = (string) json_encode($data, JSON_UNESCAPED_UNICODE);
+    if (crm_has_deferred() && !ini_get('zlib.output_compression')) {
+        // Lets the client finish reading even when the SAPI has no finish_request().
+        header('Content-Length: ' . strlen($json));
+        header('Connection: close');
+    }
+    echo $json;
+    crm_run_deferred();
     exit;
 }
 
@@ -255,6 +305,15 @@ function crm_cache_set(string $key, $value): void
     @file_put_contents($file, json_encode($value), LOCK_EX);
 }
 
+function crm_cache_delete(string $key): void
+{
+    $dir = crm_cache_dir();
+    if ($dir === '') {
+        return;
+    }
+    @unlink($dir . '/' . preg_replace('/[^a-z0-9_.-]/i', '_', $key) . '.json');
+}
+
 function crm_schema_cache_key(): string
 {
     return 'schema_ok_' . md5(__FILE__ . '|' . (string) @filemtime(__FILE__));
@@ -271,6 +330,8 @@ function ensure_remote_schema(mysqli $conn): void {
         $ready = true;
         return;
     }
+    // Claim first so parallel requests right after a deploy don't all run the DDL checks.
+    crm_cache_set(crm_schema_cache_key(), ['at' => time()]);
     $ok = $conn->query(
         "CREATE TABLE IF NOT EXISTS crm_sessions (
             token VARCHAR(64) NOT NULL PRIMARY KEY,
@@ -606,17 +667,42 @@ function serial_cached_stats(mysqli $conn, string $table, bool $refresh = false)
         return $cache[$table]['stats'];
     }
     $cacheKey = 'serial_stats_' . $table;
+    $toStats = static function (array $c): array {
+        return [
+            'total' => (int) $c['total'],
+            'registered' => (int) $c['registered'],
+            'unused' => max(0, (int) $c['total'] - (int) $c['registered']),
+        ];
+    };
     $fileCached = crm_cache_get($cacheKey, $refresh ? 10 : 30);
     if (is_array($fileCached) && isset($fileCached['total'], $fileCached['registered'])) {
-        $stats = [
-            'total' => (int) $fileCached['total'],
-            'registered' => (int) $fileCached['registered'],
-            'unused' => max(0, (int) $fileCached['total'] - (int) $fileCached['registered']),
-        ];
+        $stats = $toStats($fileCached);
+        $cache[$table] = ['at' => $now, 'stats' => $stats];
+        return $stats;
+    }
+    $stale = crm_cache_get($cacheKey, 86400);
+    if (is_array($stale) && isset($stale['total'], $stale['registered'])) {
+        $lockKey = $cacheKey . '_refreshing';
+        if (crm_cache_get($lockKey, 300) === null) {
+            crm_cache_set($lockKey, ['at' => $now]);
+            crm_defer(static function () use ($conn, $table, $cacheKey, $lockKey): void {
+                serial_compute_stats($conn, $table, $cacheKey);
+                crm_cache_delete($lockKey);
+            });
+        }
+        $stats = $toStats($stale);
         $cache[$table] = ['at' => $now, 'stats' => $stats];
         return $stats;
     }
 
+    $stats = serial_compute_stats($conn, $table, $cacheKey);
+    $cache[$table] = ['at' => $now, 'stats' => $stats];
+    return $stats;
+}
+
+/** @return array{total:int,registered:int,unused:int} */
+function serial_compute_stats(mysqli $conn, string $table, string $cacheKey): array
+{
     $registeredSql = is_registered_sql();
     $res = $conn->query(
         "SELECT COUNT(*) AS total,
@@ -634,8 +720,9 @@ function serial_cached_stats(mysqli $conn, string $table, bool $refresh = false)
         'registered' => $registered,
         'unused' => max(0, $total - $registered),
     ];
-    $cache[$table] = ['at' => $now, 'stats' => $stats];
-    crm_cache_set($cacheKey, $stats);
+    if ($res) {
+        crm_cache_set($cacheKey, $stats);
+    }
     return $stats;
 }
 
