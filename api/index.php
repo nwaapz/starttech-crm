@@ -142,6 +142,7 @@ if ($path === '/auth/login' && $method === 'POST') {
 // Everything below requires auth
 $user = require_auth($conn);
 crm_debug_mark('auth_ok', $user['username'] ?? '');
+crm_schedule_perf_index_build($conn);
 
 if ($path === '/auth/me' && $method === 'GET') {
     json_out(['id' => $user['id'], 'username' => $user['username'], 'role' => $user['role']]);
@@ -354,15 +355,6 @@ if ($path === '/serials' && $method === 'GET') {
         $where[] = 'NOT ' . is_registered_sql();
     }
 
-    if ($search !== '') {
-        $like = '%' . $search . '%';
-        $where[] = '(serial LIKE ? OR phone LIKE ? OR city LIKE ?)';
-        $types .= 'sss';
-        $params[] = $like;
-        $params[] = $like;
-        $params[] = $like;
-    }
-
     [$dateWhere, $dateTypes, $dateParams] = serial_date_range_filters($conn, $table, $from, $to);
     foreach ($dateWhere as $w) {
         $where[] = $w;
@@ -443,25 +435,81 @@ if ($path === '/serials' && $method === 'GET') {
         $params[] = $p;
     }
 
-    $whereSql = implode(' AND ', $where);
     $order = serial_list_order_sql($conn, $table);
-    $listSql = "SELECT * FROM `$table` WHERE $whereSql $order LIMIT ? OFFSET ?";
-    $types2 = $types . 'ii';
-    $params2 = array_merge($params, [$limit, $offset]);
-    $stmt = $conn->prepare($listSql);
-    $stmt->bind_param($types2, ...$params2);
-    $stmt->execute();
-    $res = $stmt->get_result();
+    $baseWhere = $where;
+    $baseTypes = $types;
+    $baseParams = $params;
+    $applySearch = static function (?array $filter) use ($baseWhere, $baseTypes, $baseParams): array {
+        $w = $baseWhere;
+        $t = $baseTypes;
+        $p = $baseParams;
+        if ($filter !== null) {
+            $w[] = $filter[0];
+            $t .= $filter[1];
+            foreach ($filter[2] as $v) {
+                $p[] = $v;
+            }
+        }
+        return [implode(' AND ', $w), $t, $p];
+    };
+    $runList = static function (string $whereSql, string $types, array $params) use ($conn, $table, $order, $limit, $offset): array {
+        $stmt = $conn->prepare("SELECT * FROM `$table` WHERE $whereSql $order LIMIT ? OFFSET ?");
+        if (!$stmt) {
+            json_error('DB prepare failed: ' . $conn->error, 500);
+        }
+        $types2 = $types . 'ii';
+        $params2 = array_merge($params, [$limit, $offset]);
+        $stmt->bind_param($types2, ...$params2);
+        $stmt->execute();
+        $res = $stmt->get_result();
+        $rows = [];
+        while ($row = $res->fetch_assoc()) {
+            $rows[] = $row;
+        }
+        $stmt->close();
+        return $rows;
+    };
+
+    $searchMode = 'none';
+    if ($search === '') {
+        [$whereSql, $types, $params] = $applySearch(null);
+        $rawRows = $runList($whereSql, $types, $params);
+    } else {
+        $fastFilter = serial_search_filter($search, true);
+        $rawRows = [];
+        if ($fastFilter !== null) {
+            [$whereSql, $types, $params] = $applySearch($fastFilter);
+            $rawRows = $runList($whereSql, $types, $params);
+            $searchMode = 'prefix';
+        }
+        $useSubstring = $rawRows === [];
+        if ($useSubstring && $fastFilter !== null && $page > 1) {
+            // Empty later page: only switch modes if the prefix search had no matches at all.
+            $probe = $conn->prepare("SELECT 1 FROM `$table` WHERE $whereSql LIMIT 1");
+            if ($probe) {
+                if ($types !== '') {
+                    $probe->bind_param($types, ...$params);
+                }
+                $probe->execute();
+                $useSubstring = stmt_fetch_assoc($probe) === null;
+                $probe->close();
+            }
+        }
+        if ($useSubstring) {
+            [$whereSql, $types, $params] = $applySearch(serial_search_filter($search, false));
+            $rawRows = $runList($whereSql, $types, $params);
+            $searchMode = 'substring';
+        }
+    }
     require_once __DIR__ . '/settings_store.php';
     $smsProcessing = crm_settings_get_or_default($conn, 'sms_processing', crm_default_sms_processing());
-    $rawRows = [];
-    while ($row = $res->fetch_assoc()) {
-        $rawRows[] = $row;
-    }
-    $stmt->close();
-    crm_debug_mark('serials_list_query', count($rawRows) . ' rows page=' . $page);
+    crm_debug_mark('serials_list_query', count($rawRows) . ' rows page=' . $page . ' search=' . $searchMode);
 
-    if (
+    $pageNotFull = count($rawRows) < $limit && ($rawRows !== [] || $page === 1);
+    if ($pageNotFull) {
+        $total = $offset + count($rawRows);
+        crm_debug_mark('serials_count_skipped', 'total=' . $total . ' (page not full)');
+    } elseif (
         serial_list_uses_cached_total(
             $registeredParam,
             $search,

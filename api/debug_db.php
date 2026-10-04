@@ -98,6 +98,14 @@ if ($path === '/debug/db' && $method === 'GET') {
         'processes' => $processes,
         'cacheDir' => crm_cache_dir() !== '' ? 'ok' : 'unavailable',
         'schemaCached' => crm_cache_get(crm_schema_cache_key(), 3600) !== null,
+        'finishRequest' => function_exists('fastcgi_finish_request')
+            ? 'fastcgi'
+            : (function_exists('litespeed_finish_request') ? 'litespeed' : 'none'),
+        'autoIndex' => [
+            'done' => crm_cache_get('perf_index_auto_done', 86400) !== null,
+            'building' => crm_cache_get('perf_index_auto_building', 900) !== null,
+            'failed' => crm_cache_get('perf_index_auto_failed', 3600),
+        ],
     ]);
 }
 
@@ -126,6 +134,12 @@ if ($path === '/debug/add-index' && $method === 'POST') {
     }
     $result = serial_add_next_perf_index($conn, $table);
     crm_debug_mark('debug_add_index', $result['name'] ?? 'none');
+    if ($result['ok']) {
+        crm_cache_delete('perf_index_auto_failed');
+        if ($result['remaining'] === 0) {
+            crm_cache_set('perf_index_auto_done', ['at' => time()]);
+        }
+    }
     json_out($result + ['indexes' => serial_perf_index_status($conn, $table)]);
 }
 

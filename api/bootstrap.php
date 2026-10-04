@@ -557,6 +557,7 @@ function is_registered_sql(string $alias = ''): string {
 function serial_perf_index_defs(): array
 {
     return [
+        'idx_serials_serial' => ['column' => 'serial', 'def' => 'serial'],
         'idx_serials_phone' => ['column' => 'phone', 'def' => 'phone'],
         'idx_serials_sync_updated_ms' => ['column' => 'sync_updated_ms', 'def' => 'sync_updated_ms'],
         'idx_serials_date_jalali' => ['column' => 'date_jalali', 'def' => 'date_jalali(10)'],
@@ -574,10 +575,14 @@ function serial_perf_index_defs(): array
 function serial_perf_index_status(mysqli $conn, string $table): array
 {
     $existing = [];
+    $leadingColumns = [];
     $res = $conn->query("SHOW INDEX FROM `$table`");
     if ($res) {
         while ($row = $res->fetch_assoc()) {
             $existing[(string) $row['Key_name']] = true;
+            if ((int) $row['Seq_in_index'] === 1) {
+                $leadingColumns[strtolower((string) $row['Column_name'])] = (string) $row['Key_name'];
+            }
         }
     }
     $columns = [];
@@ -589,10 +594,12 @@ function serial_perf_index_status(mysqli $conn, string $table): array
     }
     $out = [];
     foreach (serial_perf_index_defs() as $name => $d) {
+        $coveredBy = isset($existing[$name]) ? $name : ($leadingColumns[strtolower($d['column'])] ?? null);
         $out[] = [
             'name' => $name,
             'def' => $d['def'],
-            'present' => isset($existing[$name]),
+            'present' => $coveredBy !== null,
+            'coveredBy' => $coveredBy,
             'applicable' => isset($columns[$d['column']]),
         ];
     }
@@ -636,6 +643,84 @@ function serial_add_next_perf_index(mysqli $conn, string $table): array
         'ms' => round((microtime(true) - $t0) * 1000, 1),
         'remaining' => count($missing) - 1,
     ];
+}
+
+/**
+ * WHERE fragment for the serials search box.
+ * $fast=true: index-friendly prefix matches (serial / phone); null when the term can't use them.
+ * $fast=false: legacy substring match on serial, phone and city (full table scan).
+ *
+ * @return array{0:string,1:string,2:list<string>}|null
+ */
+function serial_search_filter(string $search, bool $fast): ?array
+{
+    $term = strtr(trim($search), [
+        '۰' => '0', '۱' => '1', '۲' => '2', '۳' => '3', '۴' => '4',
+        '۵' => '5', '۶' => '6', '۷' => '7', '۸' => '8', '۹' => '9',
+        '٠' => '0', '١' => '1', '٢' => '2', '٣' => '3', '٤' => '4',
+        '٥' => '5', '٦' => '6', '٧' => '7', '٨' => '8', '٩' => '9',
+    ]);
+    $term = preg_replace('/\s+/', '', $term) ?? $term;
+    if ($term === '') {
+        return null;
+    }
+    if (!$fast) {
+        $like = '%' . $term . '%';
+        return ['(serial LIKE ? OR phone LIKE ? OR city LIKE ?)', 'sss', [$like, $like, $like]];
+    }
+    if (!preg_match('/^\+?[A-Za-z0-9_-]+$/', $term)) {
+        return null;
+    }
+    $escape = static fn (string $s): string => addcslashes($s, '%_\\');
+    $parts = ['serial LIKE ?'];
+    $params = [$escape(ltrim($term, '+')) . '%'];
+    $digits = ltrim($term, '+');
+    if (ctype_digit($digits) && strlen($digits) >= 3) {
+        if (strncmp($digits, '0098', 4) === 0) {
+            $digits = '0' . substr($digits, 4);
+        } elseif (strncmp($digits, '98', 2) === 0 && strlen($digits) >= 12) {
+            $digits = '0' . substr($digits, 2);
+        } elseif ($digits[0] === '9') {
+            $digits = '0' . $digits;
+        }
+        $parts[] = 'phone LIKE ?';
+        $params[] = $escape($digits) . '%';
+    }
+    return ['(' . implode(' OR ', $parts) . ')', str_repeat('s', count($params)), $params];
+}
+
+/**
+ * Build missing perf indexes one at a time, after the response is sent.
+ * Single-flight via a cache lock; a failure backs off for an hour.
+ */
+function crm_schedule_perf_index_build(mysqli $conn): void
+{
+    $doneKey = 'perf_index_auto_done';
+    $lockKey = 'perf_index_auto_building';
+    $failKey = 'perf_index_auto_failed';
+    $canFinishEarly = function_exists('fastcgi_finish_request') || function_exists('litespeed_finish_request');
+    if (
+        !$canFinishEarly
+        || crm_cache_dir() === ''
+        || crm_cache_get($doneKey, 86400) !== null
+        || crm_cache_get($lockKey, 900) !== null
+        || crm_cache_get($failKey, 3600) !== null
+    ) {
+        return;
+    }
+    crm_cache_set($lockKey, ['at' => time()]);
+    crm_defer(static function () use ($conn, $doneKey, $lockKey, $failKey): void {
+        $table = table_exists($conn, 'old_serials') ? 'old_serials' : (table_exists($conn, 'new_serials') ? 'new_serials' : '');
+        if ($table !== '') {
+            $result = serial_add_next_perf_index($conn, $table);
+            if (!$result['ok']) {
+                crm_cache_set($failKey, $result);
+            } elseif ($result['remaining'] === 0) {
+                crm_cache_set($doneKey, ['at' => time()]);
+            }
+        }
+        crm_cache_delete($lockKey);
+    });
 }
 
 /** Fast ORDER BY for paginated serial lists (uses sync_updated_ms or time index). */
