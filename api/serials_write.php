@@ -24,6 +24,8 @@ const SW_MAX_SERIAL_LENGTH = 32;
 const SW_MIN_COMPLEX_LENGTH = 6;
 const SW_MAX_BATCH = 500000;
 const SW_CHUNK = 2000;
+/** Rows per committed INSERT. A killed request keeps every finished chunk. */
+const SW_INSERT_CHUNK = 200;
 const SW_COMPLEX_LETTERS = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
 const SW_COMPLEX_DIGITS = '23456789';
 const SW_STOM_MCODE_SCORE = 10;
@@ -433,7 +435,85 @@ function sw_existing_serials(mysqli $conn, string $table, array $serials): array
 }
 
 /**
+ * One committed multi-row INSERT IGNORE. Throws on failure; earlier chunks stay.
+ *
+ * @param string[] $chunk
+ */
+function sw_insert_serial_chunk(
+    mysqli $conn,
+    string $table,
+    array $chunk,
+    int $groupId,
+    string $category,
+    int $score,
+    ?int $warrantyMonths,
+    ?int $warrantyKm,
+    int $ivFlag,
+    ?string $city,
+    ?int $km,
+    ?string $description,
+    int $nowMs
+): int {
+    if ($chunk === []) {
+        return 0;
+    }
+    $rowSql = "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'remote_panel', ?)";
+    $sql = "INSERT IGNORE INTO `$table`
+        (serial, category, score, warranty_months, warranty_km, image_verification_required,
+         city, km, description, lan_group_id, reg_source, sync_updated_ms)
+        VALUES " . implode(',', array_fill(0, count($chunk), $rowSql));
+    $stmt = $conn->prepare($sql);
+    if (!$stmt) {
+        throw new RuntimeException('DB prepare failed: ' . $conn->error);
+    }
+    $types = str_repeat('ssiiiisisii', count($chunk));
+    $values = [];
+    foreach ($chunk as $serial) {
+        array_push(
+            $values,
+            $serial,
+            $category,
+            $score,
+            $warrantyMonths,
+            $warrantyKm,
+            $ivFlag,
+            $city,
+            $km,
+            $description,
+            $groupId,
+            $nowMs
+        );
+    }
+    // References must stay in this frame until execute(); bind_param stores them.
+    $refs = [];
+    foreach ($values as $i => $_) {
+        $refs[$i] = &$values[$i];
+    }
+    $stmt->bind_param($types, ...$refs);
+    $conn->begin_transaction();
+    try {
+        if (!$stmt->execute()) {
+            throw new RuntimeException('Insert failed: ' . $stmt->error);
+        }
+        $n = $stmt->affected_rows;
+        if (!$conn->commit()) {
+            throw new RuntimeException('Insert commit failed: ' . $conn->error);
+        }
+    } catch (Throwable $e) {
+        $conn->rollback();
+        $stmt->close();
+        throw $e;
+    }
+    $stmt->close();
+    return max(0, $n);
+}
+
+/**
+ * Insert serials in committed chunks. $afterChunk receives the running inserted
+ * count for this call after each commit (import uses it to publish end_number).
+ *
  * @param string[] $serials
+ * @param null|callable(int):void $afterChunk
  */
 function sw_insert_serials(
     mysqli $conn,
@@ -447,7 +527,8 @@ function sw_insert_serials(
     bool $imageVerification,
     ?string $city,
     ?int $km,
-    ?string $description
+    ?string $description,
+    ?callable $afterChunk = null
 ): int {
     if ($serials === []) {
         return 0;
@@ -456,46 +537,27 @@ function sw_insert_serials(
     $ivFlag = $imageVerification ? 1 : 0;
     $inserted = 0;
 
-    $sql = "INSERT IGNORE INTO `$table`
-        (serial, category, score, warranty_months, warranty_km, image_verification_required,
-         city, km, description, lan_group_id, reg_source, sync_updated_ms)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'remote_panel', ?)";
-    $stmt = $conn->prepare($sql);
-    if (!$stmt) {
-        json_error('DB prepare failed: ' . $conn->error, 500);
-    }
-
-    $conn->begin_transaction();
-    try {
-        foreach ($serials as $serial) {
-            $stmt->bind_param(
-                'ssiiiisisii',
-                $serial,
-                $category,
-                $score,
-                $warrantyMonths,
-                $warrantyKm,
-                $ivFlag,
-                $city,
-                $km,
-                $description,
-                $groupId,
-                $nowMs
-            );
-            if (!$stmt->execute()) {
-                throw new RuntimeException('Insert failed: ' . $stmt->error);
-            }
-            $inserted += $stmt->affected_rows > 0 ? 1 : 0;
+    foreach (array_chunk(array_values($serials), SW_INSERT_CHUNK) as $chunk) {
+        $inserted += sw_insert_serial_chunk(
+            $conn,
+            $table,
+            $chunk,
+            $groupId,
+            $category,
+            $score,
+            $warrantyMonths,
+            $warrantyKm,
+            $ivFlag,
+            $city,
+            $km,
+            $description,
+            $nowMs
+        );
+        sw_mcode_preregister($conn, $chunk);
+        if ($afterChunk !== null) {
+            $afterChunk($inserted);
         }
-        $conn->commit();
-    } catch (Throwable $e) {
-        $conn->rollback();
-        $stmt->close();
-        json_error($e->getMessage(), 500);
     }
-    $stmt->close();
-
-    sw_mcode_preregister($conn, $serials);
 
     return $inserted;
 }
@@ -1249,10 +1311,14 @@ function sw_handle_range(mysqli $conn, array $body): void
         'range', $wMonths, $wKm, $iv
     );
 
-    $inserted = sw_insert_serials(
-        $conn, $table, $serials, $groupId, $category, $score,
-        $wMonths, $wKm, $iv, $city, $km, $description
-    );
+    try {
+        $inserted = sw_insert_serials(
+            $conn, $table, $serials, $groupId, $category, $score,
+            $wMonths, $wKm, $iv, $city, $km, $description
+        );
+    } catch (Throwable $e) {
+        json_error($e->getMessage(), 500);
+    }
 
     if ($inserted <= 0) {
         sw_delete_group_row($conn, $groupId);
@@ -1451,10 +1517,14 @@ function sw_handle_complex(mysqli $conn, array $body): void
     );
 
     $serials = array_keys($accepted);
-    $inserted = sw_insert_serials(
-        $conn, $table, $serials, $groupId, $category, $score,
-        $wMonths, $wKm, $iv, $city, $km, $description
-    );
+    try {
+        $inserted = sw_insert_serials(
+            $conn, $table, $serials, $groupId, $category, $score,
+            $wMonths, $wKm, $iv, $city, $km, $description
+        );
+    } catch (Throwable $e) {
+        json_error($e->getMessage(), 500);
+    }
 
     if ($inserted <= 0) {
         sw_delete_group_row($conn, $groupId);
@@ -1482,8 +1552,45 @@ function sw_handle_complex(mysqli $conn, array $body): void
     ]);
 }
 
+function sw_count_group_serials(mysqli $conn, string $table, int $groupId): int
+{
+    $stmt = $conn->prepare("SELECT COUNT(*) AS c FROM `$table` WHERE lan_group_id = ?");
+    if (!$stmt) {
+        return 0;
+    }
+    $stmt->bind_param('i', $groupId);
+    if (!$stmt->execute()) {
+        $stmt->close();
+        return 0;
+    }
+    $row = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+    return (int) ($row['c'] ?? 0);
+}
+
+function sw_require_import_group(mysqli $conn, int $groupId): void
+{
+    sw_ensure_serial_groups_table($conn);
+    $stmt = $conn->prepare('SELECT generation_mode FROM serial_groups WHERE id = ? LIMIT 1');
+    if (!$stmt) {
+        json_error('DB prepare failed: ' . $conn->error, 500);
+    }
+    $stmt->bind_param('i', $groupId);
+    if (!$stmt->execute()) {
+        $err = $stmt->error;
+        $stmt->close();
+        json_error('DB execute failed: ' . $err, 500);
+    }
+    $row = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+    if (!$row || (string) ($row['generation_mode'] ?? '') !== 'import') {
+        json_error('Import group not found.', 404);
+    }
+}
+
 function sw_handle_import(mysqli $conn, array $body): void
 {
+    @set_time_limit(120);
     $table = serials_table($conn);
     sw_ensure_columns($conn, $table);
 
@@ -1497,6 +1604,15 @@ function sw_handle_import(mysqli $conn, array $body): void
     $score = sw_require_score($body['score'] ?? 1);
     $category = sw_require_category($body['category'] ?? '');
     [$wMonths, $wKm] = sw_require_warranty($body['warrantyMonths'] ?? null, $body['warrantyKm'] ?? null);
+
+    $appendGroupId = 0;
+    if (array_key_exists('groupId', $body) && $body['groupId'] !== null && $body['groupId'] !== '') {
+        $appendGroupId = (int) $body['groupId'];
+        if ($appendGroupId <= 0) {
+            json_error('Import group not found.', 404);
+        }
+        sw_require_import_group($conn, $appendGroupId);
+    }
 
     $normalized = [];
     $invalid = [];
@@ -1544,6 +1660,14 @@ function sw_handle_import(mysqli $conn, array $body): void
     $skipped = $skippedInFile + $skippedExisting;
 
     if ($toInsert === []) {
+        if ($appendGroupId > 0) {
+            json_out([
+                'inserted' => 0,
+                'skipped' => $skipped,
+                'total' => $totalNormalized,
+                'groupId' => $appendGroupId,
+            ]);
+        }
         json_error('No new serials to import — all ' . count($uniqueList) . ' were duplicates.', 400);
     }
 
@@ -1558,21 +1682,39 @@ function sw_handle_import(mysqli $conn, array $body): void
         $maxLen = max($maxLen, strlen($s));
     }
 
-    $groupId = sw_create_group(
-        $conn, SW_IMPORT_PREFIX, 0, count($toInsert), $maxLen, $description, $score, $category,
-        'import', $wMonths, $wKm, $iv
-    );
+    $createdHere = false;
+    if ($appendGroupId > 0) {
+        $groupId = $appendGroupId;
+        $baseline = sw_count_group_serials($conn, $table, $groupId);
+    } else {
+        $groupId = sw_create_group(
+            $conn, SW_IMPORT_PREFIX, 0, 0, $maxLen, $description, $score, $category,
+            'import', $wMonths, $wKm, $iv
+        );
+        $createdHere = true;
+        $baseline = 0;
+    }
 
-    $inserted = sw_insert_serials(
-        $conn, $table, $toInsert, $groupId, $category, $score,
-        $wMonths, $wKm, $iv, $city, $km, $description
-    );
+    $inserted = 0;
+    try {
+        $inserted = sw_insert_serials(
+            $conn, $table, $toInsert, $groupId, $category, $score,
+            $wMonths, $wKm, $iv, $city, $km, $description,
+            static function (int $soFar) use ($conn, $groupId, $baseline): void {
+                sw_update_group_end($conn, $groupId, $baseline + $soFar);
+            }
+        );
+    } catch (Throwable $e) {
+        if ($createdHere && sw_count_group_serials($conn, $table, $groupId) === 0) {
+            sw_delete_group_row($conn, $groupId);
+        }
+        json_error($e->getMessage(), 500);
+    }
 
-    if ($inserted <= 0) {
+    if ($inserted <= 0 && $createdHere) {
         sw_delete_group_row($conn, $groupId);
         $groupId = 0;
-    } else {
-        sw_update_group_end($conn, $groupId, $inserted);
+    } elseif ($inserted > 0) {
         require_once __DIR__ . '/activity_store.php';
         crm_activity_record($conn, 'serials_added', [
             'inserted' => $inserted,
@@ -1587,6 +1729,6 @@ function sw_handle_import(mysqli $conn, array $body): void
         'inserted' => $inserted,
         'skipped' => $skipped,
         'total' => $totalNormalized,
-        'groupId' => $inserted > 0 ? $groupId : null,
+        'groupId' => $groupId > 0 ? $groupId : null,
     ]);
 }
