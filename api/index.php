@@ -349,90 +349,99 @@ if ($path === '/serials' && $method === 'GET') {
     $types = '';
     $params = [];
 
-    if ($registeredParam === 'true') {
-        $where[] = is_registered_sql();
-    } elseif ($registeredParam === 'false') {
-        $where[] = 'NOT ' . is_registered_sql();
+    // A serial token (S391, M100) must match whether or not the row is registered
+    // and regardless of the report's date, group, source, or location filters.
+    $serialLookup = serial_search_is_serial_lookup($search);
+    if ($serialLookup) {
+        crm_debug_mark('serials_lookup_unfiltered', $search);
     }
 
-    [$dateWhere, $dateTypes, $dateParams] = serial_date_range_filters($conn, $table, $from, $to);
-    foreach ($dateWhere as $w) {
-        $where[] = $w;
-    }
-    $types .= $dateTypes;
-    foreach ($dateParams as $p) {
-        $params[] = $p;
-    }
-
-    $hasCategory = column_exists($conn, $table, 'category');
-    if ($hasCategory && $categoryParams !== []) {
-        $placeholders = implode(',', array_fill(0, count($categoryParams), '?'));
-        $where[] = "category IN ($placeholders)";
-        $types .= str_repeat('s', count($categoryParams));
-        foreach ($categoryParams as $c) {
-            $params[] = $c;
+    if (!$serialLookup) {
+        if ($registeredParam === 'true') {
+            $where[] = is_registered_sql();
+        } elseif ($registeredParam === 'false') {
+            $where[] = 'NOT ' . is_registered_sql();
         }
-    }
 
-    $hasRegSource = column_exists($conn, $table, 'reg_source');
-    if ($hasRegSource && $sourceParams !== []) {
-        $sourceClauses = [];
-        foreach ($sourceParams as $src) {
-            if ($src === 'sms') {
-                $sourceClauses[] = "(reg_source = 'sms' OR reg_source IS NULL OR reg_source = '')";
-            } else {
-                $sourceClauses[] = 'reg_source = ?';
-                $types .= 's';
-                $params[] = $src;
+        [$dateWhere, $dateTypes, $dateParams] = serial_date_range_filters($conn, $table, $from, $to);
+        foreach ($dateWhere as $w) {
+            $where[] = $w;
+        }
+        $types .= $dateTypes;
+        foreach ($dateParams as $p) {
+            $params[] = $p;
+        }
+
+        $hasCategory = column_exists($conn, $table, 'category');
+        if ($hasCategory && $categoryParams !== []) {
+            $placeholders = implode(',', array_fill(0, count($categoryParams), '?'));
+            $where[] = "category IN ($placeholders)";
+            $types .= str_repeat('s', count($categoryParams));
+            foreach ($categoryParams as $c) {
+                $params[] = $c;
             }
         }
-        if ($sourceClauses !== []) {
-            $where[] = '(' . implode(' OR ', $sourceClauses) . ')';
-        }
-    }
 
-    // groupIds: real serial_groups ids and/or legacy inventory bucket ids (900001/900002).
-    if ($groupIds !== []) {
-        require_once __DIR__ . '/serials_write.php';
-        sw_ensure_columns($conn, $table);
-        $groupClauses = [];
-        $realIds = [];
-        foreach ($groupIds as $gid) {
-            if (sw_is_legacy_group_id($gid)) {
-                $cat = sw_legacy_category_for_group_id($gid);
-                $ungrouped = sw_ungrouped_sql($table);
-                if ($hasCategory && $cat !== null) {
-                    $groupClauses[] = "($ungrouped AND category = ?)";
-                    $types .= 's';
-                    $params[] = $cat;
+        $hasRegSource = column_exists($conn, $table, 'reg_source');
+        if ($hasRegSource && $sourceParams !== []) {
+            $sourceClauses = [];
+            foreach ($sourceParams as $src) {
+                if ($src === 'sms') {
+                    $sourceClauses[] = "(reg_source = 'sms' OR reg_source IS NULL OR reg_source = '')";
                 } else {
-                    $groupClauses[] = "($ungrouped)";
+                    $sourceClauses[] = 'reg_source = ?';
+                    $types .= 's';
+                    $params[] = $src;
                 }
-            } else {
-                $realIds[] = $gid;
+            }
+            if ($sourceClauses !== []) {
+                $where[] = '(' . implode(' OR ', $sourceClauses) . ')';
             }
         }
-        if ($realIds !== []) {
-            $placeholders = implode(',', array_fill(0, count($realIds), '?'));
-            $groupClauses[] = "lan_group_id IN ($placeholders)";
-            $types .= str_repeat('i', count($realIds));
-            foreach ($realIds as $gid) {
-                $params[] = $gid;
-            }
-        }
-        if ($groupClauses !== []) {
-            $where[] = '(' . implode(' OR ', $groupClauses) . ')';
-        }
-    }
 
-    require_once __DIR__ . '/iran_locations.php';
-    [$locWhere, $locTypes, $locParams] = serial_location_filters($provinceId, $cityName);
-    foreach ($locWhere as $w) {
-        $where[] = $w;
-    }
-    $types .= $locTypes;
-    foreach ($locParams as $p) {
-        $params[] = $p;
+        // groupIds: real serial_groups ids and/or legacy inventory bucket ids (900001/900002).
+        if ($groupIds !== []) {
+            require_once __DIR__ . '/serials_write.php';
+            sw_ensure_columns($conn, $table);
+            $groupClauses = [];
+            $realIds = [];
+            foreach ($groupIds as $gid) {
+                if (sw_is_legacy_group_id($gid)) {
+                    $cat = sw_legacy_category_for_group_id($gid);
+                    $ungrouped = sw_ungrouped_sql($table);
+                    if ($hasCategory && $cat !== null) {
+                        $groupClauses[] = "($ungrouped AND category = ?)";
+                        $types .= 's';
+                        $params[] = $cat;
+                    } else {
+                        $groupClauses[] = "($ungrouped)";
+                    }
+                } else {
+                    $realIds[] = $gid;
+                }
+            }
+            if ($realIds !== []) {
+                $placeholders = implode(',', array_fill(0, count($realIds), '?'));
+                $groupClauses[] = "lan_group_id IN ($placeholders)";
+                $types .= str_repeat('i', count($realIds));
+                foreach ($realIds as $gid) {
+                    $params[] = $gid;
+                }
+            }
+            if ($groupClauses !== []) {
+                $where[] = '(' . implode(' OR ', $groupClauses) . ')';
+            }
+        }
+
+        require_once __DIR__ . '/iran_locations.php';
+        [$locWhere, $locTypes, $locParams] = serial_location_filters($provinceId, $cityName);
+        foreach ($locWhere as $w) {
+            $where[] = $w;
+        }
+        $types .= $locTypes;
+        foreach ($locParams as $p) {
+            $params[] = $p;
+        }
     }
 
     // Broad registered lists sorted by date need idx_serials_reg_date: without it MySQL does ~50k row

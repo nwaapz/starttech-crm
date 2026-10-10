@@ -714,6 +714,26 @@ function serial_add_next_perf_index(mysqli $conn, string $table): array
 }
 
 /**
+ * True when the report search is a serial token (has a letter), not a phone.
+ * Those lookups must ignore registration, date, group, source, and location filters.
+ */
+function serial_search_is_serial_lookup(string $search): bool
+{
+    $term = strtr(trim($search), [
+        '۰' => '0', '۱' => '1', '۲' => '2', '۳' => '3', '۴' => '4',
+        '۵' => '5', '۶' => '6', '۷' => '7', '۸' => '8', '۹' => '9',
+        '٠' => '0', '١' => '1', '٢' => '2', '٣' => '3', '٤' => '4',
+        '٥' => '5', '٦' => '6', '٧' => '7', '٨' => '8', '٩' => '9',
+    ]);
+    $term = preg_replace('/\s+/', '', $term) ?? $term;
+    $term = ltrim($term, '+');
+    if ($term === '' || !preg_match('/^[A-Za-z0-9_-]+$/', $term)) {
+        return false;
+    }
+    return (bool) preg_match('/[A-Za-z]/', $term);
+}
+
+/**
  * WHERE fragment for the serials search box.
  * $fast=true: index-friendly prefix matches (serial / phone); null when the term can't use them.
  * $fast=false: legacy substring match on serial, phone and city (full table scan).
@@ -1476,6 +1496,26 @@ function format_jalali(int $y, int $m, int $d): string {
     return sprintf('%04d/%02d/%02d', $y, $m, $d);
 }
 
+/** The Jalali day after $date (YYYY/MM/DD), or null when $date is not a date. */
+function jalali_next_day(string $date): ?string
+{
+    $parsed = parse_jalali_date($date);
+    if ($parsed === null) {
+        return null;
+    }
+    [$y, $m, $d] = $parsed;
+    $d++;
+    if ($d > jalali_days_in_month($y, $m)) {
+        $d = 1;
+        $m++;
+        if ($m > 12) {
+            $m = 1;
+            $y++;
+        }
+    }
+    return format_jalali($y, $m, $d);
+}
+
 /**
  * Inclusive list of Jalali YYYY/MM/DD keys from $from through $to (capped ~3 years).
  * @return list<string>
@@ -1543,7 +1583,8 @@ function normalize_jalali_date_param(string $raw): string {
 /**
  * Build WHERE fragments for a Jalali registration-date range.
  *
- * Uses date_jalali when present (YYYY/MM/DD); otherwise falls back to Gregorian `time`.
+ * Uses date_jalali when present (YYYY/MM/DD, or that date plus a time).
+ * The end bound is the next Jalali day, so a time suffix still falls on the selected day.
  * Rows with neither a usable date_jalali nor time are EXCLUDED when a range is set
  * (unlike the old bug that kept NULL dates in every range).
  *
@@ -1605,9 +1646,18 @@ function serial_date_range_filters(mysqli $conn, string $table, string $from, st
     if ($to !== '') {
         $parts = [];
         if ($hasJalali) {
-            $parts[] = "($jalaliOk AND date_jalali <= ?)";
-            $types .= 's';
-            $params[] = $to;
+            // Exclusive next day so "1404/07/18 13:33:00" still counts as 1404/07/18.
+            // A date-only "<=" drops any row whose date_jalali has a time suffix.
+            $toExclusive = jalali_next_day($to);
+            if ($toExclusive !== null) {
+                $parts[] = "($jalaliOk AND date_jalali < ?)";
+                $types .= 's';
+                $params[] = $toExclusive;
+            } else {
+                $parts[] = "($jalaliOk AND date_jalali <= ?)";
+                $types .= 's';
+                $params[] = $to;
+            }
         }
         if ($hasTime && $gTo !== null) {
             $parts[] = "($jalaliMissing AND $timeOk AND time < DATE_ADD(?, INTERVAL 1 DAY))";
