@@ -1568,10 +1568,19 @@ function sw_count_group_serials(mysqli $conn, string $table, int $groupId): int
     return (int) ($row['c'] ?? 0);
 }
 
-function sw_require_import_group(mysqli $conn, int $groupId): void
+/**
+ * Load the serial_groups row serials are appended into. Any panel-created group
+ * (import, complex, range) is allowed; legacy synthetic cards are not real groups.
+ *
+ * @return array<string,mixed>
+ */
+function sw_load_append_group(mysqli $conn, int $groupId): array
 {
+    if (sw_is_legacy_group_id($groupId)) {
+        json_error('افزودن سریال به کارت موجودی قدیمی مجاز نیست.', 400);
+    }
     sw_ensure_serial_groups_table($conn);
-    $stmt = $conn->prepare('SELECT generation_mode FROM serial_groups WHERE id = ? LIMIT 1');
+    $stmt = $conn->prepare('SELECT * FROM serial_groups WHERE id = ? LIMIT 1');
     if (!$stmt) {
         json_error('DB prepare failed: ' . $conn->error, 500);
     }
@@ -1583,9 +1592,10 @@ function sw_require_import_group(mysqli $conn, int $groupId): void
     }
     $row = $stmt->get_result()->fetch_assoc();
     $stmt->close();
-    if (!$row || (string) ($row['generation_mode'] ?? '') !== 'import') {
-        json_error('Import group not found.', 404);
+    if (!$row) {
+        json_error('Group not found.', 404);
     }
+    return $row;
 }
 
 function sw_handle_import(mysqli $conn, array $body): void
@@ -1601,17 +1611,28 @@ function sw_handle_import(mysqli $conn, array $body): void
     if (count($rawSerials) > SW_MAX_BATCH) {
         json_error('Import exceeds maximum of ' . SW_MAX_BATCH . ' serials.', 400);
     }
-    $score = sw_require_score($body['score'] ?? 1);
-    $category = sw_require_category($body['category'] ?? '');
-    [$wMonths, $wKm] = sw_require_warranty($body['warrantyMonths'] ?? null, $body['warrantyKm'] ?? null);
-
+    // Appending into an existing card: every setting comes from that card so the
+    // new rows match the ones already in it. Otherwise the body defines a new card.
     $appendGroupId = 0;
+    $appendGroup = null;
     if (array_key_exists('groupId', $body) && $body['groupId'] !== null && $body['groupId'] !== '') {
         $appendGroupId = (int) $body['groupId'];
         if ($appendGroupId <= 0) {
-            json_error('Import group not found.', 404);
+            json_error('Group not found.', 404);
         }
-        sw_require_import_group($conn, $appendGroupId);
+        $appendGroup = sw_load_append_group($conn, $appendGroupId);
+    }
+    if ($appendGroup !== null) {
+        $score = max(1, (int) ($appendGroup['score'] ?? 1));
+        $category = sw_require_category((string) ($appendGroup['category'] ?? ''));
+        $wMonths = isset($appendGroup['warranty_months']) && (int) $appendGroup['warranty_months'] > 0
+            ? (int) $appendGroup['warranty_months'] : null;
+        $wKm = isset($appendGroup['warranty_km']) && (int) $appendGroup['warranty_km'] > 0
+            ? (int) $appendGroup['warranty_km'] : null;
+    } else {
+        $score = sw_require_score($body['score'] ?? 1);
+        $category = sw_require_category($body['category'] ?? '');
+        [$wMonths, $wKm] = sw_require_warranty($body['warrantyMonths'] ?? null, $body['warrantyKm'] ?? null);
     }
 
     $normalized = [];
@@ -1660,22 +1681,28 @@ function sw_handle_import(mysqli $conn, array $body): void
     $skipped = $skippedInFile + $skippedExisting;
 
     if ($toInsert === []) {
-        if ($appendGroupId > 0) {
-            json_out([
-                'inserted' => 0,
-                'skipped' => $skipped,
-                'total' => $totalNormalized,
-                'groupId' => $appendGroupId,
-            ]);
-        }
-        json_error('No new serials to import — all ' . count($uniqueList) . ' were duplicates.', 400);
+        // An all-duplicate chunk is a normal outcome of a chunked upload (the client
+        // keeps sending the next slice), so it is a 200 with inserted = 0, not an error.
+        json_out([
+            'inserted' => 0,
+            'skipped' => $skipped,
+            'total' => $totalNormalized,
+            'groupId' => $appendGroupId > 0 ? $appendGroupId : null,
+            'allDuplicates' => true,
+        ]);
     }
 
-    $iv = (bool) ($body['imageVerificationRequired'] ?? false);
+    if ($appendGroup !== null) {
+        $iv = !empty($appendGroup['image_verification_required']);
+        $description = isset($appendGroup['description']) && trim((string) $appendGroup['description']) !== ''
+            ? trim((string) $appendGroup['description']) : null;
+    } else {
+        $iv = (bool) ($body['imageVerificationRequired'] ?? false);
+        $description = isset($body['description']) && trim((string) $body['description']) !== ''
+            ? trim((string) $body['description']) : null;
+    }
     $city = isset($body['city']) && trim((string) $body['city']) !== '' ? trim((string) $body['city']) : null;
     $km = isset($body['km']) && is_numeric($body['km']) ? (int) $body['km'] : null;
-    $description = isset($body['description']) && trim((string) $body['description']) !== ''
-        ? trim((string) $body['description']) : null;
 
     $maxLen = 0;
     foreach ($toInsert as $s) {
@@ -1683,6 +1710,10 @@ function sw_handle_import(mysqli $conn, array $body): void
     }
 
     $createdHere = false;
+    // end_number is a row count only for import/complex cards; on range cards it is
+    // the range end and must not be rewritten when serials are appended.
+    $trackCount = $appendGroup === null
+        || in_array((string) ($appendGroup['generation_mode'] ?? ''), ['import', 'complex'], true);
     if ($appendGroupId > 0) {
         $groupId = $appendGroupId;
         $baseline = sw_count_group_serials($conn, $table, $groupId);
@@ -1700,8 +1731,10 @@ function sw_handle_import(mysqli $conn, array $body): void
         $inserted = sw_insert_serials(
             $conn, $table, $toInsert, $groupId, $category, $score,
             $wMonths, $wKm, $iv, $city, $km, $description,
-            static function (int $soFar) use ($conn, $groupId, $baseline): void {
-                sw_update_group_end($conn, $groupId, $baseline + $soFar);
+            static function (int $soFar) use ($conn, $groupId, $baseline, $trackCount): void {
+                if ($trackCount) {
+                    sw_update_group_end($conn, $groupId, $baseline + $soFar);
+                }
             }
         );
     } catch (Throwable $e) {

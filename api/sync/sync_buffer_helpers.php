@@ -176,15 +176,23 @@ function sync_buffer_enqueue_serial_lookup(
     if (!$check || $check->num_rows === 0) {
         return;
     }
-    $stmt = $conn->prepare("SELECT * FROM `$table` WHERE UPPER(serial) = ? LIMIT 1");
-    if (!$stmt) {
-        return;
+    // Indexed lookup first (serials stored uppercase, case-insensitive collation);
+    // UPPER(serial) defeats the index and full-scans ~800k rows, so only as fallback.
+    $row = null;
+    foreach (['serial', 'UPPER(serial)'] as $expr) {
+        $stmt = $conn->prepare("SELECT * FROM `$table` WHERE $expr = ? LIMIT 1");
+        if (!$stmt) {
+            return;
+        }
+        $stmt->bind_param('s', $serial);
+        $stmt->execute();
+        $res = $stmt->get_result();
+        $row = $res ? $res->fetch_assoc() : null;
+        $stmt->close();
+        if ($row) {
+            break;
+        }
     }
-    $stmt->bind_param('s', $serial);
-    $stmt->execute();
-    $res = $stmt->get_result();
-    $row = $res ? $res->fetch_assoc() : null;
-    $stmt->close();
     if (!$row) {
         return;
     }
