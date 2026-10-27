@@ -187,6 +187,14 @@ function crm_default_referral(): array
     ];
 }
 
+function crm_default_club_welcome(): array
+{
+    return [
+        'enabled' => false,
+        'message' => '',
+    ];
+}
+
 function crm_default_whatsapp_config(): array
 {
     return [
@@ -624,6 +632,21 @@ function crm_handle_settings_routes(mysqli $conn, string $method, string $path):
                 'maxDepth' => max(1, min(20, (int) ($body['maxDepth'] ?? 3))),
             ];
             json_out(crm_settings_put($conn, 'referral_settings', $out));
+        }
+    }
+
+    // ----- Club welcome SMS (on successful registration) -----
+    if ($path === '/settings/club-welcome') {
+        if ($method === 'GET') {
+            json_out(crm_settings_get_or_default($conn, 'club_welcome_settings', crm_default_club_welcome()));
+        }
+        if ($method === 'PUT') {
+            $body = body_json();
+            $out = [
+                'enabled' => (bool) ($body['enabled'] ?? false),
+                'message' => trim((string) ($body['message'] ?? '')),
+            ];
+            json_out(crm_settings_put($conn, 'club_welcome_settings', $out));
         }
     }
 

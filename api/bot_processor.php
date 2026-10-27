@@ -144,6 +144,23 @@ function bot_process_incoming(mysqli $conn, string $channel, array $update): voi
     $reply = is_array($result) ? (string) ($result['reply'] ?? '') : (string) $result;
     bot_send_with_menu($conn, $channel, $token, $chatId, $phone, $reply, $now);
 
+    if (is_array($result) && !empty($result['registrationSucceeded'])) {
+        $welcomeSerial = trim((string) ($result['registeredSerial'] ?? ''));
+        if ($welcomeSerial !== '') {
+            $table = serials_table($conn);
+            $stmt = $conn->prepare("SELECT * FROM `$table` WHERE UPPER(serial) = UPPER(?) LIMIT 1");
+            if ($stmt) {
+                $stmt->bind_param('s', $welcomeSerial);
+                $stmt->execute();
+                $welcomeRow = stmt_fetch_assoc($stmt);
+                $stmt->close();
+                if ($welcomeRow && function_exists('crm_send_registration_welcome_sms')) {
+                    crm_send_registration_welcome_sms($conn, $phone, $welcomeRow);
+                }
+            }
+        }
+    }
+
     if (is_array($result)
         && !empty($result['registrationSucceeded'])
         && !empty($result['imageVerificationRequired'])

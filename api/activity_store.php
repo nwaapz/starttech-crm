@@ -276,6 +276,7 @@ function crm_activity_settings_label(string $key): string
         'telegram_settings' => 'تنظیمات تلگرام',
         'bale_settings' => 'تنظیمات بله',
         'referral_settings' => 'معرفی دوستان',
+        'club_welcome_settings' => 'پیام خوش‌آمد ثبت',
         'whatsapp_config' => 'واتساپ',
         'lottery_preset' => 'پیش‌فرض قرعه‌کشی',
         'device_sync' => 'همگام‌سازی دستگاه',

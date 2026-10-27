@@ -1354,6 +1354,56 @@ function crm_build_completion_reminder_message(mysqli $conn, array $row): ?strin
  * Send SMS via Melipayamak panel (same path as legacy CRM SMS.php / lottery helper).
  * @return true|string true on success, error message on failure
  */
+/**
+ * Optional welcome SMS after successful registration (club_welcome_settings).
+ * Best-effort: logs failures, does not throw.
+ */
+function crm_send_registration_welcome_sms(mysqli $conn, string $phone, array $row): void
+{
+    require_once __DIR__ . '/settings_store.php';
+    require_once __DIR__ . '/comms_store.php';
+    require_once __DIR__ . '/club_auto_runner.php';
+    $settings = crm_settings_get_or_default($conn, 'club_welcome_settings', crm_default_club_welcome());
+    if (empty($settings['enabled'])) {
+        return;
+    }
+    $template = trim((string) ($settings['message'] ?? ''));
+    if ($template === '') {
+        return;
+    }
+    $normalizedPhone = comms_normalize_phone($phone);
+    if ($normalizedPhone === '' || !preg_match('/^09\d{9}$/', $normalizedPhone)) {
+        return;
+    }
+    $km = '';
+    if (isset($row['km']) && $row['km'] !== null && $row['km'] !== '') {
+        $km = (string) (int) $row['km'];
+    }
+    $date = serial_date_jalali($row) ?? '';
+    if ($date === '' && !empty($row['date_jalali'])) {
+        $date = trim((string) $row['date_jalali']);
+    }
+    $reg = [
+        'serial' => (string) ($row['serial'] ?? ''),
+        'km' => $km,
+        'date' => $date,
+    ];
+    if ($reg['serial'] === '') {
+        return;
+    }
+    $message = crm_club_apply_placeholders($template, $reg);
+    if (trim($message) === '') {
+        return;
+    }
+    $sendResult = crm_send_panel_sms($normalizedPhone, $message);
+    if ($sendResult !== true) {
+        comms_insert($conn, $normalizedPhone, 'outgoing', $message, 'sms', 'failed');
+        error_log('[crm_send_registration_welcome_sms] ' . (is_string($sendResult) ? $sendResult : 'failed'));
+        return;
+    }
+    comms_insert($conn, $normalizedPhone, 'outgoing', $message, 'sms', 'sent');
+}
+
 function crm_send_panel_sms(string $phone, string $message) {
     $digits = preg_replace('/\D/', '', trim($phone));
     if ($digits !== '' && strpos($digits, '98') === 0 && strlen($digits) >= 12) {
