@@ -771,7 +771,6 @@ if (preg_match('#^/serials/(\d+)$#', $path, $m) && $method === 'PUT') {
     $hasKm = array_key_exists('km', $body);
     $kmSql = $hasKm && $body['km'] !== null && $body['km'] !== '' ? (int) $body['km'] : null;
     $hasJalali = column_exists($conn, $table, 'date_jalali');
-    $phoneChanged = $newPhone !== $oldPhone;
 
     $sets = ['serial=?', 'phone=?'];
     $types = 'ss';
@@ -809,20 +808,18 @@ if (preg_match('#^/serials/(\d+)$#', $path, $m) && $method === 'PUT') {
     if (!$got) {
         json_error('Not found', 404);
     }
-    if ($phoneChanged) {
-        $message = crm_build_registration_confirmation_message($conn, $got);
-        $sendResult = crm_send_panel_sms($newPhone, $message);
-        if ($sendResult !== true) {
-            comms_insert($conn, $newPhone, 'outgoing', $message, 'sms', 'failed');
-            json_error(
-                is_string($sendResult) && $sendResult !== ''
-                    ? $sendResult
-                    : 'SMS send failed',
-                502
-            );
-        }
-        comms_insert($conn, $newPhone, 'outgoing', $message, 'sms', 'sent');
+    $message = crm_build_registration_confirmation_message($conn, $got);
+    $sendResult = crm_send_panel_sms($newPhone, $message);
+    if ($sendResult !== true) {
+        comms_insert($conn, $newPhone, 'outgoing', $message, 'sms', 'failed');
+        json_error(
+            is_string($sendResult) && $sendResult !== ''
+                ? $sendResult
+                : 'SMS send failed',
+            502
+        );
     }
+    comms_insert($conn, $newPhone, 'outgoing', $message, 'sms', 'sent');
     require_once __DIR__ . '/sync/sync_buffer_helpers.php';
     sync_buffer_enqueue_serial_row($conn, $got);
     require_once __DIR__ . '/activity_store.php';
