@@ -861,6 +861,8 @@ if (preg_match('#^/serial-groups/(\d+)$#', $path, $m) && $method === 'PUT') {
 // Persistable CRM settings (GET/PUT) + club auto rules + admin users.
 crm_handle_settings_routes($conn, $method, $path);
 crm_handle_club_auto_routes($conn, $method, $path);
+require_once __DIR__ . '/announcement_store.php';
+crm_handle_announcement_routes($conn, $method, $path);
 crm_handle_admin_user_routes($conn, $method, $path, $user);
 
 require_once __DIR__ . '/comms_bots_routes.php';
@@ -943,6 +945,7 @@ if (in_array($method, ['POST', 'PUT', 'DELETE'], true)) {
     // Settings / club-auto / admin users / lottery preset / whatsapp config are handled above.
     $settingsWriteOk = starts_with($path, '/settings')
         || starts_with($path, '/club-auto-messages')
+        || starts_with($path, '/announcements')
         || $path === '/whatsapp/config'
         || starts_with($path, '/lottery')
         || starts_with($path, '/admin/users')

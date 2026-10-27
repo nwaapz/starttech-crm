@@ -1060,7 +1060,9 @@ function crm_handle_club_auto_routes(mysqli $conn, string $method, string $path)
     }
     if ($path === '/club-auto-messages/tick' && $method === 'POST') {
         $summary = crm_club_run_due_rules($conn);
-        json_out(['ok' => true] + $summary);
+        require_once __DIR__ . '/announcement_runner.php';
+        $announcements = crm_ann_tick_all($conn);
+        json_out(['ok' => true] + $summary + ['announcements' => $announcements]);
     }
 
     return false;

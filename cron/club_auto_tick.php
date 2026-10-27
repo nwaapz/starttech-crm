@@ -19,6 +19,7 @@ $root = dirname(__DIR__);
 require_once $root . '/api/bootstrap.php';
 require_once $root . '/api/settings_store.php';
 require_once $root . '/api/club_auto_runner.php';
+require_once $root . '/api/announcement_runner.php';
 
 date_default_timezone_set('Asia/Tehran');
 
@@ -50,5 +51,9 @@ if ($forceRuleId !== null) {
 }
 
 $summary = crm_club_run_due_rules($conn);
-echo '[' . $started . '] ' . json_encode($summary, JSON_UNESCAPED_UNICODE) . "\n";
+$announcements = crm_ann_tick_all($conn);
+echo '[' . $started . '] ' . json_encode(
+    $summary + ['announcements' => $announcements],
+    JSON_UNESCAPED_UNICODE
+) . "\n";
 exit(0);
